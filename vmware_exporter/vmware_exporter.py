@@ -231,7 +231,7 @@ class VmwareCollector():
                 labels=self._labelNames['hosts'] + ['state']),
             'vmware_host_maintenance_mode': GaugeMetricFamily(
                 'vmware_host_maintenance_mode',
-                'VMWare Host maintenance mode (true / false)',
+                'VMware Host maintenance mode (true / false)',
                 labels=self._labelNames['hosts']),
             'vmware_host_boot_timestamp_seconds': GaugeMetricFamily(
                 'vmware_host_boot_timestamp_seconds',
@@ -272,27 +272,27 @@ class VmwareCollector():
                 labels=self._labelNames['hosts'] + ['name', 'type']),
             'vmware_host_sensor_fan': GaugeMetricFamily(
                 'vmware_host_sensor_fan',
-                'VMWare sensor fan speed value in RPM labeled by sensor name from the host.',
+                'VMware sensor fan speed value in RPM labeled by sensor name from the host.',
                 labels=self._labelNames['hosts'] + ['name']),
             'vmware_host_sensor_temperature': GaugeMetricFamily(
                 'vmware_host_sensor_temperature',
-                'VMWare sensor temperature value in degree C labeled by sensor name from the host.',
+                'VMware sensor temperature value in degree C labeled by sensor name from the host.',
                 labels=self._labelNames['hosts'] + ['name']),
             'vmware_host_sensor_power_voltage': GaugeMetricFamily(
                 'vmware_host_sensor_power_voltage',
-                'VMWare sensor power voltage value in volt labeled by sensor name from the host.',
+                'VMware sensor power voltage value in volt labeled by sensor name from the host.',
                 labels=self._labelNames['hosts'] + ['name']),
             'vmware_host_sensor_power_current': GaugeMetricFamily(
                 'vmware_host_sensor_power_current',
-                'VMWare sensor power current value in amp labeled by sensor name from the host.',
+                'VMware sensor power current value in amp labeled by sensor name from the host.',
                 labels=self._labelNames['hosts'] + ['name']),
             'vmware_host_sensor_power_watt': GaugeMetricFamily(
                 'vmware_host_sensor_power_watt',
-                'VMWare sensor power watt value in watt labeled by sensor name from the host.',
+                'VMware sensor power watt value in watt labeled by sensor name from the host.',
                 labels=self._labelNames['hosts'] + ['name']),
             'vmware_host_sensor_redundancy': GaugeMetricFamily(
                 'vmware_host_sensor_redundancy',
-                'VMWare sensor redundancy value (1=ok / 0=ko) labeled by sensor name from the host.',
+                'VMware sensor redundancy value (1=ok / 0=ko) labeled by sensor name from the host.',
                 labels=self._labelNames['hosts'] + ['name']),
         }
 
@@ -434,6 +434,22 @@ class VmwareCollector():
         logging.info("Finished collecting metrics from {vsphere_host}".format(vsphere_host=vsphere_host))
 
         return list(metrics.values())  # noqa: F705
+
+    def _sanitize_custom_attribute_value(self, value):
+        """
+        Sanitize custom attribute values to handle multiline content and special characters
+        """
+        if value is None:
+            return 'n/a'
+        
+        # Convert to string and handle multiline content
+        sanitized_value = str(value).replace('\n', ' ').replace('\r', ' ').strip()
+        
+        # Handle empty values
+        if not sanitized_value:
+            return 'n/a'
+            
+        return sanitized_value
 
     def _to_epoch(self, my_date):
         """ convert to epoch time """
@@ -650,12 +666,12 @@ class VmwareCollector():
         it get an empty dict
         """
         if self.fetch_custom_attributes:
-            self._datastoresCustomAttributes = dict(
-                [
-                    (ds_moId, ds.get('customValue', {}))
-                    for ds_moId, ds in datastores.items()
-                ]
-            )
+            self._datastoresCustomAttributes = {}
+            for ds_moId, ds in datastores.items():
+                custom_attrs = {}
+                for attr_name, attr_value in ds.get('customValue', {}).items():
+                    custom_attrs[attr_name] = self._sanitize_custom_attribute_value(attr_value)
+                self._datastoresCustomAttributes[ds_moId] = custom_attrs
 
         fetch_time = datetime.datetime.utcnow() - start
         logging.info("Fetched vim.Datastore inventory ({fetch_time})".format(fetch_time=fetch_time))
@@ -716,12 +732,12 @@ class VmwareCollector():
         it get an empty dict
         """
         if self.fetch_custom_attributes:
-            self._hostsCustomAttributes = dict(
-                [
-                    (host_moId, host.get('summary.customValue', {}))
-                    for host_moId, host in host_systems.items()
-                ]
-            )
+            self._hostsCustomAttributes = {}
+            for host_moId, host in host_systems.items():
+                custom_attrs = {}
+                for attr_name, attr_value in host.get('summary.customValue', {}).items():
+                    custom_attrs[attr_name] = self._sanitize_custom_attribute_value(attr_value)
+                self._hostsCustomAttributes[host_moId] = custom_attrs
 
         fetch_time = datetime.datetime.utcnow() - start
         logging.info("Fetched vim.HostSystem inventory ({fetch_time})".format(fetch_time=fetch_time))
@@ -786,12 +802,12 @@ class VmwareCollector():
         it get an empty dict
         """
         if self.fetch_custom_attributes:
-            self._vmsCustomAttributes = dict(
-                [
-                    (vm_moId, vm.get('summary.customValue', {}))
-                    for vm_moId, vm in virtual_machines.items()
-                ]
-            )
+            self._vmsCustomAttributes = {}
+            for vm_moId, vm in virtual_machines.items():
+                custom_attrs = {}
+                for attr_name, attr_value in vm.get('summary.customValue', {}).items():
+                    custom_attrs[attr_name] = self._sanitize_custom_attribute_value(attr_value)
+                self._vmsCustomAttributes[vm_moId] = custom_attrs
 
         fetch_time = datetime.datetime.utcnow() - start
         logging.info("Fetched vim.VirtualMachine inventory ({fetch_time})".format(fetch_time=fetch_time))
@@ -920,6 +936,11 @@ class VmwareCollector():
                 for ds in customAttributes.keys():
                     if labelName not in customAttributes[ds].keys():
                         customAttributes[ds][labelName] = 'n/a'
+                    else:
+                        # Clean up the value - handle multiline content
+                        value = customAttributes[ds][labelName]
+                        if value is not None:
+                            customAttributes[ds][labelName] = str(value).replace('\n', ' ').replace('\r', ' ').strip()
 
         return customAttributes
 
@@ -941,6 +962,11 @@ class VmwareCollector():
                 for host in customAttributes.keys():
                     if labelName not in customAttributes[host].keys():
                         customAttributes[host][labelName] = 'n/a'
+                    else:
+                        # Clean up the value - handle multiline content
+                        value = customAttributes[host][labelName]
+                        if value is not None:
+                            customAttributes[host][labelName] = str(value).replace('\n', ' ').replace('\r', ' ').strip()
 
         return customAttributes
 
@@ -962,6 +988,11 @@ class VmwareCollector():
                 for vm in customAttributes.keys():
                     if labelName not in customAttributes[vm].keys():
                         customAttributes[vm][labelName] = 'n/a'
+                    else:
+                        # Clean up the value - handle multiline content
+                        value = customAttributes[vm][labelName]
+                        if value is not None:
+                            customAttributes[vm][labelName] = str(value).replace('\n', ' ').replace('\r', ' ').strip()
 
         return customAttributes
 
@@ -1191,11 +1222,24 @@ class VmwareCollector():
 
                 for metric_name in self._metricNames.get(metric_type, []):
                     metric = metrics.get(metric_name)
-                    labelnames = metric._labelnames
-                    metric._labelnames = labelnames[0:len(self._labelNames[metric_type])]
-                    metric._labelnames += customAttributesLabelNames
-                    metric._labelnames += labelnames[len(self._labelNames[metric_type]):]
-                    metric._labelnames = list(map(lambda x: re.sub('[^a-zA-Z0-9_]', '_', x), metric._labelnames))
+                    if metric:  # Add safety check
+                        labelnames = metric._labelnames
+                        # Ensure we don't duplicate labels
+                        base_labels = labelnames[0:len(self._labelNames[metric_type])]
+                        existing_custom_start = len(self._labelNames[metric_type])
+                        
+                        # Only add custom attributes if not already present
+                        if len(labelnames) <= existing_custom_start or customAttributesLabelNames:
+                            # Clean and normalize custom attribute names
+                            cleaned_custom_attrs = list(map(lambda x: re.sub('[^a-zA-Z0-9_]', '_', str(x)), customAttributesLabelNames))
+                            
+                            # Rebuild label names in correct order
+                            metric._labelnames = base_labels + cleaned_custom_attrs
+                            
+                            # Add any remaining labels (like alarm names, etc.)
+                            remaining_labels = labelnames[len(self._labelNames[metric_type]):]
+                            if remaining_labels:
+                                metric._labelnames += remaining_labels
 
     @defer.inlineCallbacks
     def _vmware_get_datastores(self, ds_metrics):
@@ -1250,8 +1294,13 @@ class VmwareCollector():
                 time to insert the custom attributes values in order
                 """
                 customLabels = []
-                for labelName in customAttributesLabelNames:
-                    customLabels.append(customAttributes[datastore_id].get(labelName))
+                if self.fetch_custom_attributes and customAttributesLabelNames:
+                    for labelName in customAttributesLabelNames:
+                        value = customAttributes.get(datastore_id, {}).get(labelName, 'n/a')
+                        # Ensure the value is a string and handle multiline content
+                        if value is not None:
+                            value = str(value).replace('\n', ' ').replace('\r', ' ').strip()
+                        customLabels.append(value or 'n/a')
 
                 labels += customLabels
 
@@ -1538,8 +1587,13 @@ class VmwareCollector():
             labels = vm_labels[moid]
 
             customLabels = []
-            for labelName in customAttributesLabelNames:
-                customLabels.append(customAttributes[moid].get(labelName))
+            if self.fetch_custom_attributes and customAttributesLabelNames:
+                for labelName in customAttributesLabelNames:
+                    value = customAttributes.get(moid, {}).get(labelName, 'n/a')
+                    # Ensure the value is a string and handle multiline content
+                    if value is not None:
+                        value = str(value).replace('\n', ' ').replace('\r', ' ').strip()
+                    customLabels.append(value or 'n/a')
 
             if self.fetch_tags:
                 tags = vm_tags.get(moid, [])
@@ -1677,8 +1731,13 @@ class VmwareCollector():
                     labels += [tags]
 
                 customLabels = []
-                for labelName in customAttributesLabelNames:
-                    customLabels.append(customAttributes[host_id].get(labelName))
+                if self.fetch_custom_attributes and customAttributesLabelNames:
+                    for labelName in customAttributesLabelNames:
+                        value = customAttributes.get(host_id, {}).get(labelName, 'n/a')
+                        # Ensure the value is a string and handle multiline content
+                        if value is not None:
+                            value = str(value).replace('\n', ' ').replace('\r', ' ').strip()
+                        customLabels.append(value or 'n/a')
 
                 labels += customLabels
 
@@ -1971,6 +2030,7 @@ class VMWareMetricsResource(Resource):
         elif request.args.get(b'target', [None])[0]:
             vsphere_host = request.args.get(b'target', [None])[0].decode('utf-8')
         elif request.args.get(b'vsphere_host', [None])[0]:
+           
             vsphere_host = request.args.get(b'vsphere_host')[0].decode('utf-8')
         else:
             request.setResponseCode(500)
