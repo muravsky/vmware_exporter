@@ -29,13 +29,13 @@ Get VMware vCenter information:
 Alternatively, if you don't wish to install the package, run it using `$ vmware_exporter/vmware_exporter.py` or use the following docker command:
 
 ```
-docker run -it --rm  -p 9272:9272 -e VSPHERE_USER=${VSPHERE_USERNAME} -e VSPHERE_PASSWORD=${VSPHERE_PASSWORD} -e VSPHERE_HOST=${VSPHERE_HOST} -e VSPHERE_IGNORE_SSL=True -e VSPHERE_SPECS_SIZE=2000 --name vmware_exporter pryorda/vmware_exporter
+docker run -it --rm  -p 9272:9272 -e VSPHERE_USER=${VSPHERE_USERNAME} -e VSPHERE_PASSWORD=${VSPHERE_PASSWORD} -e VSPHERE_HOST=${VSPHERE_HOST} -e VSPHERE_IGNORE_SSL=True -e VSPHERE_SPECS_SIZE=2000 --name vmware_exporter muravsky/vmware-exporter
 ```
 
 When using containers combined with `--env-file` flag, please use capital letters to set bolleans, for example:
 
 ```
-$ podman run -it --rm -p 9272:9272 --name vmware_exporter --env-file config.env pryorda/vmware_exporter
+$ podman run -it --rm -p 9272:9272 --name vmware_exporter --env-file config.env muravsky/vmware-exporter
 $ cat config.env
 VSPHERE_USER=administrator@vsphere.my.domain.com
 VSPHERE_PASSWORD=Secure-Pass
