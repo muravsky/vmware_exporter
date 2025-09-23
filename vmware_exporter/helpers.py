@@ -85,7 +85,11 @@ def batch_fetch_properties(content, obj_type, properties):
 
                     properties[prop.name] = dict(
                         [
-                            (allCustomAttributesNames[attribute.key], attribute.value)
+                            (
+                                allCustomAttributesNames[attribute.key], 
+                                # Ensure multiline values are properly escaped/joined and handle None values
+                                str(attribute.value).replace('\n', ' ').replace('\r', ' ').strip() if attribute.value is not None else 'n/a'
+                            )
                             for attribute in prop.val
                             if attribute.key in allCustomAttributesNames
                         ]

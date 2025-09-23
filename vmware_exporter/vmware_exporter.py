@@ -75,6 +75,8 @@ class VmwareCollector():
         self.specs_size = int(specs_size)
 
         self._session = None
+        self._connection = None  # Cache connection separately
+        self._content = None     # Cache content separately
 
         # Custom Attributes
         # flag to wheter fetch custom attributes or not
@@ -406,6 +408,12 @@ class VmwareCollector():
 
         logging.info("Start collecting metrics from {vsphere_host}".format(vsphere_host=vsphere_host))
 
+        # Test connection early to provide better error messages
+        connection = yield self.connection
+        if connection is None:
+            logging.error("Cannot collect metrics - failed to connect to vSphere host")
+            return list(metrics.values())  # Return empty metrics
+
         self._labels = {}
 
         collect_only = self.collect_only
@@ -427,9 +435,16 @@ class VmwareCollector():
             tasks.append(self._vmware_get_hosts(metrics))
             tasks.append(self._vmware_get_host_perf_manager_metrics(metrics))
 
-        yield parallelize(*tasks)
+        try:
+            yield parallelize(*tasks)
+        except Exception as e:
+            logging.error("Error during metrics collection: {error}".format(error=str(e)))
+            # Continue with available metrics rather than failing completely
 
-        yield self._vmware_disconnect()
+        try:
+            yield self._vmware_disconnect()
+        except Exception as e:
+            logging.warning("Error during disconnect: {error}".format(error=str(e)))
 
         logging.info("Finished collecting metrics from {vsphere_host}".format(vsphere_host=vsphere_host))
 
@@ -577,17 +592,69 @@ class VmwareCollector():
 
         return tags
 
+    @defer.inlineCallbacks
+    def _validate_connection(self, connection):
+        """
+        Validate if the connection is still alive by trying to access content
+        """
+        if connection is None:
+            return False
+        
+        try:
+            # Try to access content to validate connection
+            yield threads.deferToThread(lambda: connection.RetrieveContent())
+            return True
+        except Exception as e:
+            logging.warning("Connection validation failed: {error}".format(error=str(e)))
+            return False
+
+    def _clear_connection_cache(self):
+        """
+        Clear cached connection and related objects
+        """
+        if hasattr(self, '_connection'):
+            del self._connection
+        if hasattr(self, '_content'):
+            del self._content
+        # Clear any other cached properties
+        for attr_name in list(self.__dict__.keys()):
+            if attr_name.startswith('_cached_'):
+                delattr(self, attr_name)
+
     @run_once_property
     @defer.inlineCallbacks
     def connection(self):
         """
         Connect to Vcenter and get connection
         """
+        # Validate required connection parameters
+        if not self.host:
+            logging.error("vSphere host is not configured")
+            return None
+            
+        if not self.username:
+            logging.error("vSphere username is not configured")
+            return None
+            
+        if not self.password:
+            logging.error("vSphere password is not configured")
+            return None
+
+        # Check if we have a cached connection and if it's still valid
+        if hasattr(self, '_connection') and self._connection is not None:
+            is_valid = yield self._validate_connection(self._connection)
+            if is_valid:
+                return self._connection
+            else:
+                logging.info("Cached connection is invalid, creating new connection")
+                self._clear_connection_cache()
+        
         context = None
         if self.ignore_ssl:
             context = ssl._create_unverified_context()
 
         try:
+            logging.info(f"Attempting to connect to vSphere host: {self.host} with user: {self.username}")
             vmware_connect = yield threads.deferToThread(
                 connect.SmartConnect,
                 host=self.host,
@@ -595,10 +662,15 @@ class VmwareCollector():
                 pwd=self.password,
                 sslContext=context,
             )
+            logging.info("Successfully connected to vSphere")
+            self._connection = vmware_connect
             return vmware_connect
 
         except vmodl.MethodFault as error:
             logging.error("Caught vmodl fault: {error}".format(error=error.msg))
+            return None
+        except Exception as error:
+            logging.error("Failed to connect to vSphere: {error}".format(error=str(error)))
             return None
 
     @run_once_property
@@ -606,6 +678,11 @@ class VmwareCollector():
     def content(self):
         logging.info("Retrieving service instance content")
         connection = yield self.connection
+        
+        if connection is None:
+            logging.error("Failed to establish vSphere connection - cannot retrieve content")
+            return None
+            
         content = yield threads.deferToThread(
             connection.RetrieveContent
         )
@@ -616,13 +693,43 @@ class VmwareCollector():
     @defer.inlineCallbacks
     def batch_fetch_properties(self, objtype, properties):
         content = yield self.content
-        batch = yield threads.deferToThread(
-            batch_fetch_properties,
-            content,
-            objtype,
-            properties,
-        )
-        return batch
+        
+        if content is None:
+            logging.error("Cannot fetch properties - no vSphere connection available")
+            return {}
+        
+        retry_count = 0
+        max_retries = 2
+        
+        while retry_count <= max_retries:
+            try:
+                batch = yield threads.deferToThread(
+                    batch_fetch_properties,
+                    content,
+                    objtype,
+                    properties,
+                )
+                return batch
+            except Exception as e:
+                error_str = str(e)
+                if "NotAuthenticated" in error_str and retry_count < max_retries:
+                    logging.warning("Authentication failed on attempt {}, retrying with new connection...".format(retry_count + 1))
+                    # Clear cache and get new connection
+                    self._clear_connection_cache()
+                    content = yield self.content
+                    if content is None:
+                        logging.error("Failed to get new connection after authentication error")
+                        return {}
+                    retry_count += 1
+                    continue
+                else:
+                    logging.error("Error fetching properties for {objtype}: {error}".format(
+                        objtype=objtype.__name__, error=error_str
+                    ))
+                    # Return empty dict instead of failing completely
+                    return {}
+        
+        return {}
 
     @run_once_property
     @defer.inlineCallbacks
@@ -1000,11 +1107,18 @@ class VmwareCollector():
     @defer.inlineCallbacks
     def datacenter_inventory(self):
         content = yield self.content
-        # FIXME: It's unclear if this is operating on data already fetched in
-        # content or if this is doing stealth HTTP requests
-        # Right now we assume it does stealth lookups
-        datacenters = yield threads.deferToThread(lambda: content.rootFolder.childEntity)
-        return datacenters
+        if content is None:
+            logging.error("Cannot fetch datacenter inventory - no content available")
+            return []
+        try:
+            # FIXME: It's unclear if this is operating on data already fetched in
+            # content or if this is doing stealth HTTP requests
+            # Right now we assume it does stealth lookups
+            datacenters = yield threads.deferToThread(lambda: content.rootFolder.childEntity)
+            return datacenters
+        except Exception as e:
+            logging.error("Failed to fetch datacenter inventory: {error}".format(error=str(e)))
+            return []
 
     @run_once_property
     @defer.inlineCallbacks
@@ -1012,29 +1126,37 @@ class VmwareCollector():
 
         def _collect(node, level=1, dc=None, storagePod=""):
             inventory = {}
-            if isinstance(node, vim.Folder) and not isinstance(node, vim.StoragePod):
-                logging.debug("[Folder    ] {level} {name}".format(name=node.name, level=('-' * level).ljust(7)))
-                for child in node.childEntity:
-                    inventory.update(_collect(child, level + 1, dc))
-            elif isinstance(node, vim.Datacenter):
-                logging.debug("[Datacenter] {level} {name}".format(name=node.name, level=('-' * level).ljust(7)))
-                inventory.update(_collect(node.datastoreFolder, level + 1, node.name))
-            elif isinstance(node, vim.Folder) and isinstance(node, vim.StoragePod):
-                logging.debug("[StoragePod] {level} {name}".format(name=node.name, level=('-' * level).ljust(7)))
-                for child in node.childEntity:
-                    inventory.update(_collect(child, level + 1, dc, node.name))
-            elif isinstance(node, vim.Datastore):
-                logging.debug("[Datastore ] {level} {name}".format(name=node.name, level=('-' * level).ljust(7)))
-                inventory[node.name] = [node.name, dc, storagePod]
-            else:
-                logging.debug("[?         ] {level} {node}".format(node=node, level=('-' * level).ljust(7)))
+            try:
+                if isinstance(node, vim.Folder) and not isinstance(node, vim.StoragePod):
+                    logging.debug("[Folder    ] {level} {name}".format(name=node.name, level=('-' * level).ljust(7)))
+                    for child in node.childEntity:
+                        inventory.update(_collect(child, level + 1, dc))
+                elif isinstance(node, vim.Datacenter):
+                    logging.debug("[Datacenter] {level} {name}".format(name=node.name, level=('-' * level).ljust(7)))
+                    inventory.update(_collect(node.datastoreFolder, level + 1, node.name))
+                elif isinstance(node, vim.Folder) and isinstance(node, vim.StoragePod):
+                    logging.debug("[StoragePod] {level} {name}".format(name=node.name, level=('-' * level).ljust(7)))
+                    for child in node.childEntity:
+                        inventory.update(_collect(child, level + 1, dc, node.name))
+                elif isinstance(node, vim.Datastore):
+                    logging.debug("[Datastore ] {level} {name}".format(name=node.name, level=('-' * level).ljust(7)))
+                    inventory[node.name] = [node.name, dc, storagePod]
+                else:
+                    logging.debug("[?         ] {level} {node}".format(node=node, level=('-' * level).ljust(7)))
+            except Exception as e:
+                logging.warning("Error collecting datastore label for node {node}: {error}".format(
+                    node=str(node), error=str(e)
+                ))
             return inventory
 
         labels = {}
-        dcs = yield self.datacenter_inventory
-        for dc in dcs:
-            result = yield threads.deferToThread(lambda: _collect(dc))
-            labels.update(result)
+        try:
+            dcs = yield self.datacenter_inventory
+            for dc in dcs:
+                result = yield threads.deferToThread(lambda: _collect(dc))
+                labels.update(result)
+        except Exception as e:
+            logging.error("Failed to collect datastore labels: {error}".format(error=str(e)))
 
         return labels
 
@@ -1044,33 +1166,42 @@ class VmwareCollector():
 
         def _collect(node, level=1, dc=None, folder=None):
             inventory = {}
-            if isinstance(node, vim.Folder) and not isinstance(node, vim.StoragePod):
-                logging.debug("[Folder    ] {level} {name}".format(level=('-' * level).ljust(7), name=node.name))
-                for child in node.childEntity:
-                    inventory.update(_collect(child, level + 1, dc))
-            elif isinstance(node, vim.Datacenter):
-                logging.debug("[Datacenter] {level} {name}".format(level=('-' * level).ljust(7), name=node.name))
-                inventory.update(_collect(node.hostFolder, level + 1, node.name))
-            elif isinstance(node, vim.ComputeResource):
-                logging.debug("[ComputeRes] {level} {name}".format(level=('-' * level).ljust(7), name=node.name))
-                for host in node.host:
-                    inventory.update(_collect(host, level + 1, dc, node))
-            elif isinstance(node, vim.HostSystem):
-                logging.debug("[HostSystem] {level} {name}".format(level=('-' * level).ljust(7), name=node.name))
-                inventory[node._moId] = [
-                    node.summary.config.name.rstrip('.'),
-                    dc,
-                    folder.name if isinstance(folder, vim.ClusterComputeResource) else ''
-                ]
-            else:
-                logging.debug("[?         ] {level} {node}".format(level=('-' * level).ljust(7), node=node))
+            try:
+                if isinstance(node, vim.Folder) and not isinstance(node, vim.StoragePod):
+                    logging.debug("[Folder    ] {level} {name}".format(level=('-' * level).ljust(7), name=node.name))
+                    for child in node.childEntity:
+                        inventory.update(_collect(child, level + 1, dc))
+                elif isinstance(node, vim.Datacenter):
+                    logging.debug("[Datacenter] {level} {name}".format(level=('-' * level).ljust(7), name=node.name))
+                    inventory.update(_collect(node.hostFolder, level + 1, node.name))
+                elif isinstance(node, vim.ComputeResource):
+                    logging.debug("[ComputeRes] {level} {name}".format(level=('-' * level).ljust(7), name=node.name))
+                    for host in node.host:
+                        inventory.update(_collect(host, level + 1, dc, node))
+                elif isinstance(node, vim.HostSystem):
+                    logging.debug("[HostSystem] {level} {name}".format(level=('-' * level).ljust(7), name=node.name))
+                    inventory[node._moId] = [
+                        node.summary.config.name.rstrip('.'),
+                        dc,
+                        folder.name if isinstance(folder, vim.ClusterComputeResource) else ''
+                    ]
+                else:
+                    logging.debug("[?         ] {level} {node}".format(level=('-' * level).ljust(7), node=node))
+            except Exception as e:
+                logging.warning("Error collecting host label for node {node}: {error}".format(
+                    node=str(node), error=str(e)
+                ))
             return inventory
 
         labels = {}
-        dcs = yield self.datacenter_inventory
-        for dc in dcs:
-            result = yield threads.deferToThread(lambda: _collect(dc))
-            labels.update(result)
+        try:
+            dcs = yield self.datacenter_inventory
+            for dc in dcs:
+                result = yield threads.deferToThread(lambda: _collect(dc))
+                labels.update(result)
+        except Exception as e:
+            logging.error("Failed to collect host labels: {error}".format(error=str(e)))
+            
         return labels
 
     @run_once_property
@@ -1113,7 +1244,12 @@ class VmwareCollector():
     @defer.inlineCallbacks
     def vm_labels(self):
 
-        virtual_machines, host_labels = yield parallelize(self.vm_inventory, self.host_labels)
+        try:
+            virtual_machines, host_labels = yield parallelize(self.vm_inventory, self.host_labels)
+        except Exception as e:
+            logging.error("Failed to fetch VM or host inventory: {error}".format(error=str(e)))
+            virtual_machines = {}
+            host_labels = {}
 
         labels = {}
         for moid, row in virtual_machines.items():
@@ -1133,8 +1269,11 @@ class VmwareCollector():
 
             labels[moid] = labels[moid] + [p]
 
-            if host_moid in host_labels:
+            if host_moid and host_moid in host_labels:
                 labels[moid] = labels[moid] + host_labels[host_moid]
+            else:
+                # Add default host labels if host info not available
+                labels[moid] = labels[moid] + ['n/a', 'n/a', 'n/a']  # host_name, dc_name, cluster_name
 
             if 'guest.ipAddress' in row:
                 labels[moid] = labels[moid] + [row['guest.ipAddress']]
@@ -1149,11 +1288,12 @@ class VmwareCollector():
                 labels_cnt += 1
 
             if labels_cnt < len(self._labelNames['vms']):
-                logging.info(
-                    "Only ${cnt}/{expected} labels (vm, host, dc, cluster) found, filling n/a"
+                logging.debug(
+                    "Only {cnt}/{expected} labels (vm, host, dc, cluster) found for VM {vm}, filling n/a"
                     .format(
                         cnt=labels_cnt,
-                        expected=len(self._labelNames['vms'])
+                        expected=len(self._labelNames['vms']),
+                        vm=row['name']
                     )
                 )
 
@@ -1171,24 +1311,39 @@ class VmwareCollector():
         performance stat example: cpu.usagemhz.LATEST
         """
         content = yield self.content
-        counter_info = {}
-        for counter in content.perfManager.perfCounter:
-            prefix = counter.groupInfo.key
-            counter_full = "{}.{}.{}".format(prefix, counter.nameInfo.key, counter.rollupType)
-            counter_info[counter_full] = counter.key
-        return counter_info
+        if content is None:
+            logging.error("Cannot fetch counter IDs - no content available")
+            return {}
+            
+        try:
+            counter_info = {}
+            for counter in content.perfManager.perfCounter:
+                prefix = counter.groupInfo.key
+                counter_full = "{}.{}.{}".format(prefix, counter.nameInfo.key, counter.rollupType)
+                counter_info[counter_full] = counter.key
+            return counter_info
+        except Exception as e:
+            logging.error("Failed to fetch performance counter IDs: {error}".format(error=str(e)))
+            return {}
 
     @defer.inlineCallbacks
     def _vmware_disconnect(self):
         """
         Disconnect from Vcenter
         """
-        connection = yield self.connection
-        yield threads.deferToThread(
-            connect.Disconnect,
-            connection,
-        )
-        del self.connection
+        try:
+            if hasattr(self, '_connection') and self._connection is not None:
+                yield threads.deferToThread(
+                    connect.Disconnect,
+                    self._connection,
+                )
+                logging.debug("Successfully disconnected from vSphere")
+            # Clear all cached connection-related objects
+            self._clear_connection_cache()
+        except Exception as e:
+            logging.warning("Error during disconnect: {error}".format(error=str(e)))
+            # Still clear cache even if disconnect failed
+            self._clear_connection_cache()
 
     def _vmware_full_snapshots_list(self, snapshots):
         """
@@ -1222,24 +1377,28 @@ class VmwareCollector():
 
                 for metric_name in self._metricNames.get(metric_type, []):
                     metric = metrics.get(metric_name)
-                    if metric:  # Add safety check
-                        labelnames = metric._labelnames
-                        # Ensure we don't duplicate labels
-                        base_labels = labelnames[0:len(self._labelNames[metric_type])]
-                        existing_custom_start = len(self._labelNames[metric_type])
+                    if metric and customAttributesLabelNames:  # Only proceed if we have custom attributes
+                        labelnames = list(metric._labelnames)  # Convert to list to ensure consistency
+                        base_label_count = len(self._labelNames[metric_type])
                         
-                        # Only add custom attributes if not already present
-                        if len(labelnames) <= existing_custom_start or customAttributesLabelNames:
+                        # Check if custom attributes haven't been added yet
+                        if len(labelnames) == base_label_count or (
+                            len(labelnames) > base_label_count and 
+                            labelnames[base_label_count] not in customAttributesLabelNames
+                        ):
                             # Clean and normalize custom attribute names
-                            cleaned_custom_attrs = list(map(lambda x: re.sub('[^a-zA-Z0-9_]', '_', str(x)), customAttributesLabelNames))
+                            cleaned_custom_attrs = [
+                                re.sub('[^a-zA-Z0-9_]', '_', str(attr_name))
+                                for attr_name in customAttributesLabelNames
+                            ]
                             
-                            # Rebuild label names in correct order
-                            metric._labelnames = base_labels + cleaned_custom_attrs
+                            # Rebuild label names: base + custom + any additional (like alarm labels)
+                            base_labels = labelnames[:base_label_count]
+                            additional_labels = labelnames[base_label_count:] if len(labelnames) > base_label_count else []
                             
-                            # Add any remaining labels (like alarm names, etc.)
-                            remaining_labels = labelnames[len(self._labelNames[metric_type]):]
-                            if remaining_labels:
-                                metric._labelnames += remaining_labels
+                            # Ensure all parts are lists before concatenation
+                            new_labelnames = base_labels + cleaned_custom_attrs + additional_labels
+                            metric._labelnames = tuple(new_labelnames)  # Convert back to tuple
 
     @defer.inlineCallbacks
     def _vmware_get_datastores(self, ds_metrics):
@@ -1271,12 +1430,12 @@ class VmwareCollector():
         """
         updates the datastore metric label names with custom attributes names
         """
-        self.updateMetricsLabelNames(ds_metrics, ['datastores'])
+        yield self.updateMetricsLabelNames(ds_metrics, ['datastores'])
 
         for datastore_id, datastore in results.items():
             try:
                 name = datastore['name']
-                labels = datastore_labels[name]
+                base_labels = datastore_labels[name].copy()
 
                 """
                 insert the tags values if needed
@@ -1287,8 +1446,7 @@ class VmwareCollector():
                     tags = ','.join(tags)
                     if not tags:
                         tags = 'n/a'
-
-                    labels += [tags]
+                    base_labels.append(tags)
 
                 """
                 time to insert the custom attributes values in order
@@ -1302,7 +1460,8 @@ class VmwareCollector():
                             value = str(value).replace('\n', ' ').replace('\r', ' ').strip()
                         customLabels.append(value or 'n/a')
 
-                labels += customLabels
+                # Create the final base labels (for metrics without additional labels)
+                final_base_labels = base_labels + customLabels
 
             except KeyError as e:
                 logging.info(
@@ -1316,14 +1475,14 @@ class VmwareCollector():
                 filter red and yellow alarms
             """
             if self.fetch_alarms:
-                alarms = datastore.get('triggeredAlarmState').split(',')
+                alarms = datastore.get('triggeredAlarmState', '').split(',')
                 alarms = [a for a in alarms if ':' in a]
 
                 # Red alarms
                 red_alarms = [':'.join(a.split(':')[:-1]) for a in alarms if a.split(':')[-1] == 'red']
                 red_alarms_label = ','.join(red_alarms) if red_alarms else 'n/a'
                 ds_metrics['vmware_datastore_red_alarms'].add_metric(
-                    labels + [red_alarms_label],
+                    final_base_labels + [red_alarms_label],
                     len(red_alarms)
                 )
 
@@ -1331,7 +1490,7 @@ class VmwareCollector():
                 yellow_alarms = [':'.join(a.split(':')[:-1]) for a in alarms if a.split(':')[-1] == 'yellow']
                 yellow_alarms_label = ','.join(yellow_alarms) if yellow_alarms else 'n/a'
                 ds_metrics['vmware_datastore_yellow_alarms'].add_metric(
-                    labels + [yellow_alarms_label],
+                    final_base_labels + [yellow_alarms_label],
                     len(yellow_alarms)
                 )
 
@@ -1340,27 +1499,27 @@ class VmwareCollector():
             ds_uncommitted = float(datastore.get('summary.uncommitted', 0))
             ds_provisioned = ds_capacity - ds_freespace + ds_uncommitted
 
-            ds_metrics['vmware_datastore_capacity_size'].add_metric(labels, ds_capacity)
-            ds_metrics['vmware_datastore_freespace_size'].add_metric(labels, ds_freespace)
-            ds_metrics['vmware_datastore_uncommited_size'].add_metric(labels, ds_uncommitted)
-            ds_metrics['vmware_datastore_provisoned_size'].add_metric(labels, ds_provisioned)
+            ds_metrics['vmware_datastore_capacity_size'].add_metric(final_base_labels, ds_capacity)
+            ds_metrics['vmware_datastore_freespace_size'].add_metric(final_base_labels, ds_freespace)
+            ds_metrics['vmware_datastore_uncommited_size'].add_metric(final_base_labels, ds_uncommitted)
+            ds_metrics['vmware_datastore_provisoned_size'].add_metric(final_base_labels, ds_provisioned)
 
-            ds_metrics['vmware_datastore_hosts'].add_metric(labels, len(datastore.get('host', [])))
-            ds_metrics['vmware_datastore_vms'].add_metric(labels, len(datastore.get('vm', [])))
+            ds_metrics['vmware_datastore_hosts'].add_metric(final_base_labels, len(datastore.get('host', [])))
+            ds_metrics['vmware_datastore_vms'].add_metric(final_base_labels, len(datastore.get('vm', [])))
 
             ds_metrics['vmware_datastore_maintenance_mode'].add_metric(
-                labels + [datastore.get('summary.maintenanceMode', 'unknown')],
+                final_base_labels + [datastore.get('summary.maintenanceMode', 'unknown')],
                 1
             )
 
             ds_metrics['vmware_datastore_type'].add_metric(
-                labels + [datastore.get('summary.type', 'normal')],
+                final_base_labels + [datastore.get('summary.type', 'normal')],
                 1
             )
 
             if 'summary.accessible' in datastore:
                 ds_metrics['vmware_datastore_accessible'].add_metric(
-                    labels,
+                    final_base_labels,
                     datastore['summary.accessible'] * 1,
                 )
 
@@ -1370,7 +1529,18 @@ class VmwareCollector():
     def _vmware_get_vm_perf_manager_metrics(self, vm_metrics):
         logging.info('START: _vmware_get_vm_perf_manager_metrics')
 
-        virtual_machines, counter_info = yield parallelize(self.vm_inventory, self.counter_ids)
+        try:
+            virtual_machines, counter_info = yield parallelize(self.vm_inventory, self.counter_ids)
+        except Exception as e:
+            logging.error("Failed to fetch VM inventory or counter info: {error}".format(error=str(e)))
+            logging.info('FIN: _vmware_get_vm_perf_manager_metrics (skipped due to error)')
+            return
+
+        # Check if we have valid counter info
+        if not counter_info:
+            logging.warning("No performance counter information available - skipping VM performance metrics")
+            logging.info('FIN: _vmware_get_vm_perf_manager_metrics (skipped - no counters)')
+            return
 
         # List of performance counter we want
         perf_list = [
@@ -1401,8 +1571,20 @@ class VmwareCollector():
             'sys.uptime.latest',
         ]
 
+        # Filter perf_list to only include counters we have
+        available_perf_list = [p for p in perf_list if p in counter_info]
+        
+        if not available_perf_list:
+            logging.warning("None of the desired performance counters are available - skipping VM performance metrics")
+            logging.info('FIN: _vmware_get_vm_perf_manager_metrics (skipped - no available counters)')
+            return
+
+        logging.info("Available performance counters: {count}/{total}".format(
+            count=len(available_perf_list), total=len(perf_list)
+        ))
+
         # Prepare gauges
-        for p in perf_list:
+        for p in available_perf_list:
             p_metric = 'vmware_vm_' + p.replace('.', '_')
             vm_metrics[p_metric] = GaugeMetricFamily(
                 p_metric,
@@ -1415,7 +1597,7 @@ class VmwareCollector():
 
         metrics = []
         metric_names = {}
-        for perf_metric in perf_list:
+        for perf_metric in available_perf_list:
             perf_metric_name = 'vmware_vm_' + perf_metric.replace('.', '_')
             counter_key = counter_info[perf_metric]
             metrics.append(vim.PerformanceManager.MetricId(
@@ -1427,7 +1609,7 @@ class VmwareCollector():
         """
         updates vm perf metrics label names with vms custom attributes names
         """
-        self.updateMetricsLabelNames(vm_metrics, ['vm_perf'])
+        yield self.updateMetricsLabelNames(vm_metrics, ['vm_perf'])
 
         specs = []
         for vm in virtual_machines.values():
@@ -1442,20 +1624,23 @@ class VmwareCollector():
 
         content = yield self.content
 
-        if len(specs) > 0:
-            chunks = [specs[x:x + self.specs_size] for x in range(0, len(specs), self.specs_size)]
-            for list_specs in chunks:
-                results, labels = yield parallelize(
-                    threads.deferToThread(content.perfManager.QueryStats, querySpec=list_specs),
-                    self.vm_labels,
-                )
+        if content and len(specs) > 0:
+            try:
+                chunks = [specs[x:x + self.specs_size] for x in range(0, len(specs), self.specs_size)]
+                for list_specs in chunks:
+                    results, labels = yield parallelize(
+                        threads.deferToThread(content.perfManager.QueryStats, querySpec=list_specs),
+                        self.vm_labels,
+                    )
 
-                for ent in results:
-                    for metric in ent.value:
-                        vm_metrics[metric_names[metric.id.counterId]].add_metric(
-                            labels[ent.entity._moId],
-                            float(sum(metric.value)),
-                        )
+                    for ent in results:
+                        for metric in ent.value:
+                            vm_metrics[metric_names[metric.id.counterId]].add_metric(
+                                labels[ent.entity._moId],
+                                float(sum(metric.value)),
+                            )
+            except Exception as e:
+                logging.error("Error collecting VM performance metrics: {error}".format(error=str(e)))
 
         logging.info('FIN: _vmware_get_vm_perf_manager_metrics')
 
@@ -1463,7 +1648,18 @@ class VmwareCollector():
     def _vmware_get_host_perf_manager_metrics(self, host_metrics):
         logging.info('START: _vmware_get_host_perf_manager_metrics')
 
-        host_systems, counter_info = yield parallelize(self.host_system_inventory, self.counter_ids)
+        try:
+            host_systems, counter_info = yield parallelize(self.host_system_inventory, self.counter_ids)
+        except Exception as e:
+            logging.error("Failed to fetch host inventory or counter info: {error}".format(error=str(e)))
+            logging.info('FIN: _vmware_get_host_perf_manager_metrics (skipped due to error)')
+            return
+
+        # Check if we have valid counter info
+        if not counter_info:
+            logging.warning("No performance counter information available - skipping host performance metrics")
+            logging.info('FIN: _vmware_get_host_perf_manager_metrics (skipped - no counters)')
+            return
 
         # List of performance counter we want
         perf_list = [
@@ -1501,8 +1697,20 @@ class VmwareCollector():
             'datastore.datastoreWriteIops.latest',
         ]
 
+        # Filter perf_list to only include counters we have
+        available_perf_list = [p for p in perf_list if p in counter_info]
+        
+        if not available_perf_list:
+            logging.warning("None of the desired host performance counters are available - skipping host performance metrics")
+            logging.info('FIN: _vmware_get_host_perf_manager_metrics (skipped - no available counters)')
+            return
+
+        logging.info("Available host performance counters: {count}/{total}".format(
+            count=len(available_perf_list), total=len(perf_list)
+        ))
+
         # Prepare gauges
-        for p in perf_list:
+        for p in available_perf_list:
             p_metric = 'vmware_host_' + p.replace('.', '_')
             host_metrics[p_metric] = GaugeMetricFamily(
                 p_metric,
@@ -1512,7 +1720,7 @@ class VmwareCollector():
 
         metrics = []
         metric_names = {}
-        for perf_metric in perf_list:
+        for perf_metric in available_perf_list:
             perf_metric_name = 'vmware_host_' + perf_metric.replace('.', '_')
             counter_key = counter_info[perf_metric]
             metrics.append(vim.PerformanceManager.MetricId(
@@ -1522,7 +1730,7 @@ class VmwareCollector():
             metric_names[counter_key] = perf_metric_name
 
         # Insert custom attributes names as metric labels
-        self.updateMetricsLabelNames(host_metrics, ['host_perf'])
+        yield self.updateMetricsLabelNames(host_metrics, ['host_perf'])
 
         specs = []
         for host in host_systems.values():
@@ -1537,18 +1745,21 @@ class VmwareCollector():
 
         content = yield self.content
 
-        if len(specs) > 0:
-            results, labels = yield parallelize(
-                threads.deferToThread(content.perfManager.QueryStats, querySpec=specs),
-                self.host_labels,
-            )
+        if content and len(specs) > 0:
+            try:
+                results, labels = yield parallelize(
+                    threads.deferToThread(content.perfManager.QueryStats, querySpec=specs),
+                    self.host_labels,
+                )
 
-            for ent in results:
-                for metric in ent.value:
-                    host_metrics[metric_names[metric.id.counterId]].add_metric(
-                        labels[ent.entity._moId],
-                        float(sum(metric.value)),
-                    )
+                for ent in results:
+                    for metric in ent.value:
+                        host_metrics[metric_names[metric.id.counterId]].add_metric(
+                            labels[ent.entity._moId],
+                            float(sum(metric.value)),
+                        )
+            except Exception as e:
+                logging.error("Error collecting host performance metrics: {error}".format(error=str(e)))
 
         logging.info('FIN: _vmware_get_host_perf_manager_metrics')
 
@@ -1576,7 +1787,7 @@ class VmwareCollector():
             customAttributesLabelNames = yield self.customAttributesLabelNames('vms')
 
         # Insert custom attributes names as metric labels
-        self.updateMetricsLabelNames(metrics, ['vms', 'vmguests', 'snapshots'])
+        yield self.updateMetricsLabelNames(metrics, ['vms', 'vmguests', 'snapshots'])
 
         for moid, row in virtual_machines.items():
             # Ignore vm if field "runtime.host" does not exist
@@ -1584,8 +1795,16 @@ class VmwareCollector():
             if 'runtime.host' not in row:
                 continue
 
-            labels = vm_labels[moid]
+            # Get base labels and create a copy to avoid modifying the original
+            base_labels = vm_labels[moid].copy()
 
+            # Add tags if enabled
+            if self.fetch_tags:
+                tags = vm_tags.get(moid, [])
+                tags = ','.join(tags) if tags else 'n/a'
+                base_labels.append(tags)
+
+            # Add custom attributes
             customLabels = []
             if self.fetch_custom_attributes and customAttributesLabelNames:
                 for labelName in customAttributesLabelNames:
@@ -1595,16 +1814,8 @@ class VmwareCollector():
                         value = str(value).replace('\n', ' ').replace('\r', ' ').strip()
                     customLabels.append(value or 'n/a')
 
-            if self.fetch_tags:
-                tags = vm_tags.get(moid, [])
-                tags = ','.join(tags)
-                if not tags:
-                    tags = 'n/a'
-
-                vm_labels[moid] += [tags] + customLabels
-
-            else:
-                vm_labels[moid] += customLabels
+            # Create final labels for this VM
+            final_vm_labels = base_labels + customLabels
 
             """
                 filter red and yellow alarms
@@ -1617,7 +1828,7 @@ class VmwareCollector():
                 red_alarms = [':'.join(a.split(':')[:-1]) for a in alarms if a.split(':')[-1] == 'red']
                 red_alarms_label = ','.join(red_alarms) if red_alarms else 'n/a'
                 metrics['vmware_vm_red_alarms'].add_metric(
-                    labels + [red_alarms_label],
+                    final_vm_labels + [red_alarms_label],
                     len(red_alarms)
                 )
 
@@ -1625,67 +1836,67 @@ class VmwareCollector():
                 yellow_alarms = [':'.join(a.split(':')[:-1]) for a in alarms if a.split(':')[-1] == 'yellow']
                 yellow_alarms_label = ','.join(yellow_alarms) if yellow_alarms else 'n/a'
                 metrics['vmware_vm_yellow_alarms'].add_metric(
-                    labels + [yellow_alarms_label],
+                    final_vm_labels + [yellow_alarms_label],
                     len(yellow_alarms)
                 )
 
             if 'runtime.powerState' in row:
                 power_state = 1 if row['runtime.powerState'] == 'poweredOn' else 0
-                metrics['vmware_vm_power_state'].add_metric(labels, power_state)
+                metrics['vmware_vm_power_state'].add_metric(final_vm_labels, power_state)
 
                 if power_state and row.get('runtime.bootTime'):
                     metrics['vmware_vm_boot_timestamp_seconds'].add_metric(
-                        labels,
+                        final_vm_labels,
                         self._to_epoch(row['runtime.bootTime'])
                     )
 
             if 'summary.config.numCpu' in row:
-                metrics['vmware_vm_num_cpu'].add_metric(labels, row['summary.config.numCpu'])
+                metrics['vmware_vm_num_cpu'].add_metric(final_vm_labels, row['summary.config.numCpu'])
 
             if 'summary.config.memorySizeMB' in row:
-                metrics['vmware_vm_memory_max'].add_metric(labels, row['summary.config.memorySizeMB'])
+                metrics['vmware_vm_memory_max'].add_metric(final_vm_labels, row['summary.config.memorySizeMB'])
 
             if 'runtime.maxCpuUsage' in row:
-                metrics['vmware_vm_max_cpu_usage'].add_metric(labels, row['runtime.maxCpuUsage'])
+                metrics['vmware_vm_max_cpu_usage'].add_metric(final_vm_labels, row['runtime.maxCpuUsage'])
 
             if 'summary.config.template' in row:
-                metrics['vmware_vm_template'].add_metric(labels, row['summary.config.template'])
+                metrics['vmware_vm_template'].add_metric(final_vm_labels, row['summary.config.template'])
 
             if 'guest.disk' in row and len(row['guest.disk']) > 0:
                 for disk in row['guest.disk']:
                     metrics['vmware_vm_guest_disk_free'].add_metric(
-                        labels + [disk.diskPath], disk.freeSpace
+                        final_vm_labels + [disk.diskPath], disk.freeSpace
                     )
                     metrics['vmware_vm_guest_disk_capacity'].add_metric(
-                        labels + [disk.diskPath], disk.capacity
+                        final_vm_labels + [disk.diskPath], disk.capacity
                     )
 
             if 'guest.toolsStatus' in row:
                 metrics['vmware_vm_guest_tools_running_status'].add_metric(
-                    labels + [row['guest.toolsStatus']], 1
+                    final_vm_labels + [row['guest.toolsStatus']], 1
                 )
 
             if 'guest.toolsVersion' in row:
                 metrics['vmware_vm_guest_tools_version'].add_metric(
-                    labels + [row['guest.toolsVersion']], 1
+                    final_vm_labels + [row['guest.toolsVersion']], 1
                 )
 
             if 'guest.toolsVersionStatus2' in row:
                 metrics['vmware_vm_guest_tools_version_status'].add_metric(
-                    labels + [row['guest.toolsVersionStatus2']], 1
+                    final_vm_labels + [row['guest.toolsVersionStatus2']], 1
                 )
 
             if 'snapshot' in row:
                 snapshots = self._vmware_full_snapshots_list(row['snapshot'].rootSnapshotList)
 
                 metrics['vmware_vm_snapshots'].add_metric(
-                    labels,
+                    final_vm_labels,
                     len(snapshots),
                 )
 
                 for snapshot in snapshots:
                     metrics['vmware_vm_snapshot_timestamp_seconds'].add_metric(
-                        labels + [snapshot['name']],
+                        final_vm_labels + [snapshot['name']],
                         snapshot['timestamp_seconds'],
                     )
 
@@ -1716,19 +1927,18 @@ class VmwareCollector():
             customAttributesLabelNames = yield self.hostsCustomAttributesLabelNames
 
         # Insert custom attributes names as metric labels
-        self.updateMetricsLabelNames(host_metrics, ['hosts'])
+        yield self.updateMetricsLabelNames(host_metrics, ['hosts'])
 
         for host_id, host in results.items():
             try:
-                labels = host_labels[host_id]
+                base_labels = host_labels[host_id].copy()
 
                 if self.fetch_tags:
                     tags = host_tags.get(host_id, [])
                     tags = ','.join(tags)
                     if not tags:
                         tags = 'n/a'
-
-                    labels += [tags]
+                    base_labels.append(tags)  # Use append instead of += for single item
 
                 customLabels = []
                 if self.fetch_custom_attributes and customAttributesLabelNames:
@@ -1739,7 +1949,7 @@ class VmwareCollector():
                             value = str(value).replace('\n', ' ').replace('\r', ' ').strip()
                         customLabels.append(value or 'n/a')
 
-                labels += customLabels
+                final_host_labels = base_labels + customLabels
 
             except KeyError as e:
                 logging.info(
@@ -1759,7 +1969,7 @@ class VmwareCollector():
                 red_alarms = [':'.join(a.split(':')[:-1]) for a in alarms if a.split(':')[-1] == 'red']
                 red_alarms_label = ','.join(red_alarms) if red_alarms else 'n/a'
                 host_metrics['vmware_host_red_alarms'].add_metric(
-                    labels + [red_alarms_label],
+                    final_host_labels + [red_alarms_label],
                     len(red_alarms)
                 )
 
@@ -1767,7 +1977,7 @@ class VmwareCollector():
                 yellow_alarms = [':'.join(a.split(':')[:-1]) for a in alarms if a.split(':')[-1] == 'yellow']
                 yellow_alarms_label = ','.join(yellow_alarms) if yellow_alarms else 'n/a'
                 host_metrics['vmware_host_yellow_alarms'].add_metric(
-                    labels + [yellow_alarms_label],
+                    final_host_labels + [yellow_alarms_label],
                     len(yellow_alarms)
                 )
 
@@ -1792,49 +2002,49 @@ class VmwareCollector():
                 }[sensor['sensorStatus'].lower()]
 
                 host_metrics['vmware_host_sensor_state'].add_metric(
-                    labels + [sensor['name'], sensor['type']],
+                    final_host_labels + [sensor['name'], sensor['type']],
                     sensor_status
                 )
 
                 # FAN speed
                 if sensor["unit"] == 'rpm':
                     host_metrics['vmware_host_sensor_fan'].add_metric(
-                        labels + [sensor['name']],
+                        final_host_labels + [sensor['name']],
                         int(sensor['value']) * (10 ** (int(sensor['unitModifier'])))
                     )
 
                 # Temperature
                 if sensor["unit"] == 'degrees c':
                     host_metrics['vmware_host_sensor_temperature'].add_metric(
-                        labels + [sensor['name']],
+                        final_host_labels + [sensor['name']],
                         int(sensor['value']) * (10 ** (int(sensor['unitModifier'])))
                     )
 
                 # Power Voltage
                 if sensor["unit"] == 'volts':
                     host_metrics['vmware_host_sensor_power_voltage'].add_metric(
-                        labels + [sensor['name']],
+                        final_host_labels + [sensor['name']],
                         int(sensor['value']) * (10 ** (int(sensor['unitModifier'])))
                     )
 
                 # Power Current
                 if sensor["unit"] == 'amps':
                     host_metrics['vmware_host_sensor_power_current'].add_metric(
-                        labels + [sensor['name']],
+                        final_host_labels + [sensor['name']],
                         int(sensor['value']) * (10 ** (int(sensor['unitModifier'])))
                     )
 
                 # Power Watt
                 if sensor["unit"] == 'watts':
                     host_metrics['vmware_host_sensor_power_watt'].add_metric(
-                        labels + [sensor['name']],
+                        final_host_labels + [sensor['name']],
                         int(sensor['value']) * (10 ** (int(sensor['unitModifier'])))
                     )
 
                 # Redundancy
                 if sensor["unit"] == 'redundancy-discrete':
                     host_metrics['vmware_host_sensor_redundancy'].add_metric(
-                        labels + [sensor['name']],
+                        final_host_labels + [sensor['name']],
                         int(sensor['value'])
                     )
 
@@ -1842,25 +2052,25 @@ class VmwareCollector():
             standby_mode = 1 if host.get('runtime.standbyMode') == 'in' else 0
             standby_mode_state = host.get('runtime.standbyMode', 'unknown')
             host_metrics['vmware_host_standby_mode'].add_metric(
-                labels + [standby_mode_state],
+                final_host_labels + [standby_mode_state],
                 standby_mode
             )
 
             # Power state
             power_state = 1 if host['runtime.powerState'] == 'poweredOn' else 0
-            host_metrics['vmware_host_power_state'].add_metric(labels, power_state)
+            host_metrics['vmware_host_power_state'].add_metric(final_host_labels, power_state)
 
             # Host connection state (connected, disconnected, notResponding)
             connection_state = host.get('runtime.connectionState', 'unknown')
             host_metrics['vmware_host_connection_state'].add_metric(
-                labels + [connection_state],
+                final_host_labels + [connection_state],
                 1
             )
 
             # Host in maintenance mode?
             if 'runtime.inMaintenanceMode' in host:
                 host_metrics['vmware_host_maintenance_mode'].add_metric(
-                    labels,
+                    final_host_labels,
                     host['runtime.inMaintenanceMode'] * 1,
                 )
 
@@ -1870,50 +2080,50 @@ class VmwareCollector():
             if host.get('runtime.bootTime'):
                 # Host uptime
                 host_metrics['vmware_host_boot_timestamp_seconds'].add_metric(
-                    labels,
+                    final_host_labels,
                     self._to_epoch(host['runtime.bootTime'])
                 )
 
             # CPU Usage (in Mhz)
             if 'summary.quickStats.overallCpuUsage' in host:
                 host_metrics['vmware_host_cpu_usage'].add_metric(
-                    labels,
+                    final_host_labels,
                     host['summary.quickStats.overallCpuUsage'],
                 )
 
             cpu_core_num = host.get('summary.hardware.numCpuCores')
             if cpu_core_num:
-                host_metrics['vmware_host_num_cpu'].add_metric(labels, cpu_core_num)
+                host_metrics['vmware_host_num_cpu'].add_metric(final_host_labels, cpu_core_num)
 
             cpu_mhz = host.get('summary.hardware.cpuMhz')
             if cpu_core_num and cpu_mhz:
                 cpu_total = cpu_core_num * cpu_mhz
-                host_metrics['vmware_host_cpu_max'].add_metric(labels, cpu_total)
+                host_metrics['vmware_host_cpu_max'].add_metric(final_host_labels, cpu_total)
 
             # Memory Usage (in MB)
             if 'summary.quickStats.overallMemoryUsage' in host:
                 host_metrics['vmware_host_memory_usage'].add_metric(
-                    labels,
+                    final_host_labels,
                     host['summary.quickStats.overallMemoryUsage']
                 )
 
             if 'summary.hardware.memorySize' in host:
                 host_metrics['vmware_host_memory_max'].add_metric(
-                    labels,
+                    final_host_labels,
                     float(host['summary.hardware.memorySize']) / 1024 / 1024
                 )
 
             config_ver = host.get('summary.config.product.version', 'unknown')
             build_ver = host.get('summary.config.product.build', 'unknown')
             host_metrics['vmware_host_product_info'].add_metric(
-                labels + [config_ver, build_ver],
+                final_host_labels + [config_ver, build_ver],
                 1
             )
 
             hardware_cpu_model = host.get('summary.hardware.cpuModel', 'unknown')
             hardware_model = host.get('summary.hardware.model', 'unknown')
             host_metrics['vmware_host_hardware_info'].add_metric(
-                labels + [hardware_model, hardware_cpu_model],
+                final_host_labels + [hardware_model, hardware_cpu_model],
                 1
             )
         logging.info("Finished host metrics collection")
@@ -2039,10 +2249,35 @@ class VMWareMetricsResource(Resource):
             request.finish()
             return
 
+        # Debug logging to help identify configuration issues
+        vsphere_user = self.config[section]['vsphere_user']
+        vsphere_password = self.config[section]['vsphere_password']
+        
+        logging.debug("Configuration debug: section={}, host={}, user={}, password_set={}".format(
+            section, 
+            vsphere_host, 
+            vsphere_user, 
+            "Yes" if vsphere_password else "No"
+        ))
+        
+        if not vsphere_user:
+            logging.error("vSphere username is not configured for section: {}".format(section))
+            request.setResponseCode(500)
+            request.write(b'vSphere username not configured\n')
+            request.finish()
+            return
+            
+        if not vsphere_password:
+            logging.error("vSphere password is not configured for section: {}".format(section))
+            request.setResponseCode(500)
+            request.write(b'vSphere password not configured\n')
+            request.finish()
+            return
+
         collector = VmwareCollector(
             vsphere_host,
-            self.config[section]['vsphere_user'],
-            self.config[section]['vsphere_password'],
+            vsphere_user,
+            vsphere_password,
             self.config[section]['collect_only'],
             self.config[section]['specs_size'],
             self.config[section]['fetch_custom_attributes'],
