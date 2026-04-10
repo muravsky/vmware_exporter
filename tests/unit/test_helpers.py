@@ -88,3 +88,67 @@ def test_batch_fetch_properties():
             'someotherprop': 2,
         }
     }
+
+
+def test_batch_fetch_properties_custom_attributes_type_and_key_order():
+    content = mock.Mock()
+    content.viewManager.CreateContainerView.return_value = FakeView()
+
+    vm_exact = mock.Mock()
+    vm_exact.key = 100
+    vm_exact.name = 'Team'
+    vm_exact.managedObjectType = vim.VirtualMachine
+
+    vm_inherited = mock.Mock()
+    vm_inherited.key = 200
+    vm_inherited.name = 'Owner'
+    vm_inherited.managedObjectType = vim.ManagedEntity
+
+    vm_generic = mock.Mock()
+    vm_generic.key = 300
+    vm_generic.name = 'Backup'
+    vm_generic.managedObjectType = None
+
+    # Same key as vm_exact but for another type: should not override VM mapping.
+    ds_conflict = mock.Mock()
+    ds_conflict.key = 100
+    ds_conflict.name = 'DatastoreTeam'
+    ds_conflict.managedObjectType = vim.Datastore
+
+    content.customFieldsManager.field = [ds_conflict, vm_generic, vm_inherited, vm_exact]
+
+    attr_200 = mock.Mock()
+    attr_200.key = 200
+    attr_200.value = 'owner-a'
+
+    attr_100 = mock.Mock()
+    attr_100.key = 100
+    attr_100.value = 'team-a'
+
+    attr_300 = mock.Mock()
+    attr_300.key = 300
+    attr_300.value = 'yes'
+
+    prop_custom = mock.Mock()
+    prop_custom.name = 'summary.customValue'
+    # Intentionally unsorted input by key.
+    prop_custom.val = [attr_200, attr_100, attr_300]
+
+    mock_props = mock.Mock()
+    mock_props.obj._moId = 'vm:1'
+    mock_props.propSet = [prop_custom]
+
+    content.propertyCollector.RetrieveContents.return_value = [mock_props]
+
+    results = batch_fetch_properties(
+        content,
+        vim.VirtualMachine,
+        ['summary.customValue'],
+    )
+
+    assert results['vm:1']['summary.customValue'] == {
+        'Team': 'team-a',
+        'Owner': 'owner-a',
+        'Backup': 'yes',
+    }
+    assert list(results['vm:1']['summary.customValueByKey'].keys()) == [100, 200, 300]

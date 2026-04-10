@@ -8,6 +8,66 @@ def get_bool_env(key: str, default: bool):
     return value if type(value) == bool else value.lower() == 'true'
 
 
+def _managed_object_type_matches(field_type, obj_type):
+    """
+    Return True if a custom field declared for ``field_type`` applies to ``obj_type``.
+    Handles exact matches, generic fields (None) and inheritance-based matches.
+    """
+    if field_type is None:
+        return True
+
+    if field_type == obj_type:
+        return True
+
+    try:
+        return issubclass(obj_type, field_type)
+    except TypeError:
+        return False
+
+
+def _build_custom_field_key_name_map(content, obj_type):
+    """
+    Build a deterministic key -> name map for custom attributes applicable to obj_type.
+
+    If a key is exposed by multiple field definitions, prefer the most specific type:
+    exact obj_type > inherited type > generic(None).
+    """
+    key_name_with_priority = {}
+
+    manager = getattr(content, 'customFieldsManager', None)
+    fields = getattr(manager, 'field', None)
+
+    if not fields:
+        return {}
+
+    for field in fields:
+        key = getattr(field, 'key', None)
+        name = getattr(field, 'name', None)
+        managed_type = getattr(field, 'managedObjectType', None)
+
+        if key is None or name is None:
+            continue
+
+        if not _managed_object_type_matches(managed_type, obj_type):
+            continue
+
+        if managed_type == obj_type:
+            priority = 3
+        elif managed_type is None:
+            priority = 1
+        else:
+            priority = 2
+
+        current = key_name_with_priority.get(key)
+        if current is None or priority > current[1]:
+            key_name_with_priority[key] = (name, priority)
+
+    return {
+        key: value[0]
+        for key, value in sorted(key_name_with_priority.items(), key=lambda item: item[0])
+    }
+
+
 def batch_fetch_properties(content, obj_type, properties):
     view_ref = content.viewManager.CreateContainerView(
         container=content.rootFolder,
@@ -21,19 +81,7 @@ def batch_fetch_properties(content, obj_type, properties):
         be translated later
     """
     if ('customValue' in properties) or ('summary.customValue' in properties):
-
-        allCustomAttributesNames = {}
-
-        if content.customFieldsManager and content.customFieldsManager.field:
-            allCustomAttributesNames.update(
-                dict(
-                    [
-                        (f.key, f.name)
-                        for f in content.customFieldsManager.field
-                        if f.managedObjectType in (obj_type, None)
-                    ]
-                )
-            )
+        allCustomAttributesNames = _build_custom_field_key_name_map(content, obj_type)
 
     try:
         PropertyCollector = vmodl.query.PropertyCollector
@@ -78,22 +126,24 @@ def batch_fetch_properties(content, obj_type, properties):
                 translate its name key to name
             """
             if 'customValue' in prop.name:
+                by_key_name = '{}ByKey'.format(prop.name)
 
                 properties[prop.name] = {}
+                properties[by_key_name] = {}
 
-                if allCustomAttributesNames:
+                if not prop.val:
+                    continue
 
-                    properties[prop.name] = dict(
-                        [
-                            (
-                                allCustomAttributesNames[attribute.key], 
-                                # Ensure multiline values are properly escaped/joined and handle None values
-                                str(attribute.value).replace('\n', ' ').replace('\r', ' ').strip() if attribute.value is not None else 'n/a'
-                            )
-                            for attribute in prop.val
-                            if attribute.key in allCustomAttributesNames
-                        ]
-                    )
+                for attribute in sorted(prop.val, key=lambda item: getattr(item, 'key', 0)):
+                    attr_key = getattr(attribute, 'key', None)
+                    if attr_key is None:
+                        continue
+                    attr_value = str(attribute.value).replace('\n', ' ').replace('\r', ' ').strip() \
+                        if attribute.value is not None else 'n/a'
+                    properties[by_key_name][attr_key] = attr_value
+
+                    if attr_key in allCustomAttributesNames:
+                        properties[prop.name][allCustomAttributesNames[attr_key]] = attr_value
 
             elif 'triggeredAlarmState' == prop.name:
                 """

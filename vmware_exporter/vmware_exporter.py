@@ -27,12 +27,6 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-"""
-For custom attributes
-used to plain some list of lists in a single one
-"""
-from itertools import chain
-
 # Twisted
 from twisted.web.server import Site, NOT_DONE_YET
 from twisted.web.resource import Resource
@@ -465,6 +459,44 @@ class VmwareCollector():
             return 'n/a'
             
         return sanitized_value
+
+    def _normalize_custom_attribute_label(self, label_name):
+        """
+        Normalize custom attribute names into Prometheus-safe label names.
+        """
+        return re.sub('[^a-zA-Z0-9_]', '_', str(label_name))
+
+    def _stable_custom_attribute_label_names(self, custom_attributes):
+        """
+        Build a deterministic list of raw custom attribute names.
+        """
+        names = set()
+        for attributes in custom_attributes.values():
+            names.update(attributes.keys())
+
+        return sorted(names, key=lambda item: str(item).lower())
+
+    def _normalized_unique_custom_attribute_labels(self, custom_attribute_names):
+        """
+        Convert raw custom attribute names into deterministic, unique label names.
+
+        Keeps current naming behavior for non-colliding names and only appends a suffix
+        if two names normalize to the same label.
+        """
+        normalized_labels = []
+        counters = {}
+
+        for raw_name in custom_attribute_names:
+            base = self._normalize_custom_attribute_label(raw_name)
+            idx = counters.get(base, 0)
+            counters[base] = idx + 1
+
+            if idx == 0:
+                normalized_labels.append(base)
+            else:
+                normalized_labels.append('{}_{}'.format(base, idx))
+
+        return normalized_labels
 
     def _to_epoch(self, my_date):
         """ convert to epoch time """
@@ -958,16 +990,7 @@ class VmwareCollector():
 
         if self.fetch_custom_attributes:
             customAttributes = yield self._datastoresCustomAttributes
-            customAttributesLabelNames = list(
-                set(
-                    chain(
-                        *[
-                            attributes.keys()
-                            for attributes in customAttributes.values()
-                        ]
-                    )
-                )
-            )
+            customAttributesLabelNames = self._stable_custom_attribute_label_names(customAttributes)
 
         return customAttributesLabelNames
 
@@ -985,16 +1008,7 @@ class VmwareCollector():
 
         if self.fetch_custom_attributes:
             customAttributes = yield self._hostsCustomAttributes
-            customAttributesLabelNames = list(
-                set(
-                    chain(
-                        *[
-                            attributes.keys()
-                            for attributes in customAttributes.values()
-                        ]
-                    )
-                )
-            )
+            customAttributesLabelNames = self._stable_custom_attribute_label_names(customAttributes)
 
         return customAttributesLabelNames
 
@@ -1012,16 +1026,7 @@ class VmwareCollector():
 
         if self.fetch_custom_attributes:
             customAttributes = yield self._vmsCustomAttributes
-            customAttributesLabelNames = list(
-                set(
-                    chain(
-                        *[
-                            attributes.keys()
-                            for attributes in customAttributes.values()
-                        ]
-                    )
-                )
-            )
+            customAttributesLabelNames = self._stable_custom_attribute_label_names(customAttributes)
 
         return customAttributesLabelNames
 
@@ -1374,31 +1379,25 @@ class VmwareCollector():
             for metric_type in metric_types:
 
                 customAttributesLabelNames = yield self.customAttributesLabelNames(metric_type)
+                normalized_custom_attrs = self._normalized_unique_custom_attribute_labels(customAttributesLabelNames)
 
                 for metric_name in self._metricNames.get(metric_type, []):
                     metric = metrics.get(metric_name)
                     if metric and customAttributesLabelNames:  # Only proceed if we have custom attributes
                         labelnames = list(metric._labelnames)  # Convert to list to ensure consistency
                         base_label_count = len(self._labelNames[metric_type])
-                        
-                        # Check if custom attributes haven't been added yet
-                        if len(labelnames) == base_label_count or (
-                            len(labelnames) > base_label_count and 
-                            labelnames[base_label_count] not in customAttributesLabelNames
-                        ):
-                            # Clean and normalize custom attribute names
-                            cleaned_custom_attrs = [
-                                re.sub('[^a-zA-Z0-9_]', '_', str(attr_name))
-                                for attr_name in customAttributesLabelNames
-                            ]
-                            
-                            # Rebuild label names: base + custom + any additional (like alarm labels)
-                            base_labels = labelnames[:base_label_count]
-                            additional_labels = labelnames[base_label_count:] if len(labelnames) > base_label_count else []
-                            
-                            # Ensure all parts are lists before concatenation
-                            new_labelnames = base_labels + cleaned_custom_attrs + additional_labels
-                            metric._labelnames = tuple(new_labelnames)  # Convert back to tuple
+
+                        # Rebuild labels idempotently: base + custom + additional labels.
+                        # If custom labels are already present right after base labels,
+                        # strip them before re-appending to keep order stable and avoid duplicates.
+                        base_labels = labelnames[:base_label_count]
+                        additional_labels = labelnames[base_label_count:] if len(labelnames) > base_label_count else []
+
+                        if additional_labels[:len(normalized_custom_attrs)] == normalized_custom_attrs:
+                            additional_labels = additional_labels[len(normalized_custom_attrs):]
+
+                        new_labelnames = base_labels + normalized_custom_attrs + additional_labels
+                        metric._labelnames = tuple(new_labelnames)
 
     @defer.inlineCallbacks
     def _vmware_get_datastores(self, ds_metrics):
