@@ -460,6 +460,16 @@ class VmwareCollector():
             
         return sanitized_value
 
+    def _build_custom_attribute_label_values(self, entity_id, custom_attributes, custom_attribute_label_names):
+        if not self.fetch_custom_attributes or not custom_attribute_label_names:
+            return []
+
+        custom_labels = []
+        for label_name in custom_attribute_label_names:
+            value = custom_attributes.get(entity_id, {}).get(label_name, 'n/a')
+            custom_labels.append(self._sanitize_custom_attribute_value(value))
+        return custom_labels
+
     def _normalize_custom_attribute_label(self, label_name):
         """
         Normalize custom attribute names into Prometheus-safe label names.
@@ -1605,9 +1615,16 @@ class VmwareCollector():
             ))
             metric_names[counter_key] = perf_metric_name
 
-        """
-        updates vm perf metrics label names with vms custom attributes names
-        """
+        custom_attributes = {}
+        custom_attribute_label_names = []
+        if self.fetch_custom_attributes:
+            custom_attributes = yield self.vmsCustomAttributes
+            custom_attribute_label_names = yield self.vmsCustomAttributesLabelNames
+
+        vm_tags = {}
+        if self.fetch_tags:
+            vm_tags = yield self.vm_tags
+
         yield self.updateMetricsLabelNames(vm_metrics, ['vm_perf'])
 
         specs = []
@@ -1633,9 +1650,28 @@ class VmwareCollector():
                     )
 
                     for ent in results:
+                        entity_id = ent.entity._moId
+                        base_labels = labels.get(entity_id)
+                        if base_labels is None:
+                            continue
+
+                        final_labels = base_labels.copy()
+                        if self.fetch_tags:
+                            tags = vm_tags.get(entity_id, [])
+                            tags = ','.join(tags) if tags else 'n/a'
+                            final_labels.append(tags)
+
+                        final_labels.extend(
+                            self._build_custom_attribute_label_values(
+                                entity_id,
+                                custom_attributes,
+                                custom_attribute_label_names,
+                            )
+                        )
+
                         for metric in ent.value:
                             vm_metrics[metric_names[metric.id.counterId]].add_metric(
-                                labels[ent.entity._moId],
+                                final_labels,
                                 float(sum(metric.value)),
                             )
             except Exception as e:
@@ -1728,7 +1764,16 @@ class VmwareCollector():
             ))
             metric_names[counter_key] = perf_metric_name
 
-        # Insert custom attributes names as metric labels
+        custom_attributes = {}
+        custom_attribute_label_names = []
+        if self.fetch_custom_attributes:
+            custom_attributes = yield self.hostsCustomAttributes
+            custom_attribute_label_names = yield self.hostsCustomAttributesLabelNames
+
+        host_tags = {}
+        if self.fetch_tags:
+            host_tags = yield self.host_tags
+
         yield self.updateMetricsLabelNames(host_metrics, ['host_perf'])
 
         specs = []
@@ -1752,9 +1797,28 @@ class VmwareCollector():
                 )
 
                 for ent in results:
+                    entity_id = ent.entity._moId
+                    base_labels = labels.get(entity_id)
+                    if base_labels is None:
+                        continue
+
+                    final_labels = base_labels.copy()
+                    if self.fetch_tags:
+                        tags = host_tags.get(entity_id, [])
+                        tags = ','.join(tags) if tags else 'n/a'
+                        final_labels.append(tags)
+
+                    final_labels.extend(
+                        self._build_custom_attribute_label_values(
+                            entity_id,
+                            custom_attributes,
+                            custom_attribute_label_names,
+                        )
+                    )
+
                     for metric in ent.value:
                         host_metrics[metric_names[metric.id.counterId]].add_metric(
-                            labels[ent.entity._moId],
+                            final_labels,
                             float(sum(metric.value)),
                         )
             except Exception as e:

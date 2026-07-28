@@ -1098,6 +1098,139 @@ def test_collect_host_perf():
 
 
 @pytest_twisted.inlineCallbacks
+def test_collect_host_perf_with_custom_attributes():
+    collect_only = {
+        'vms': False,
+        'vmguests': False,
+        'datastores': False,
+        'hosts': True,
+        'snapshots': False,
+    }
+    collector = VmwareCollector(
+        '127.0.0.1',
+        'root',
+        'password',
+        collect_only,
+        5000,
+        True,
+    )
+
+    metrics = collector._create_metric_containers()
+
+    metric_1 = mock.Mock()
+    metric_1.id.counterId = 2
+    metric_1.value = [3600]
+
+    ent_1 = mock.Mock()
+    ent_1.value = [metric_1]
+    ent_1.entity = vim.ManagedObject('host:1')
+
+    content = mock.Mock()
+    content.perfManager.QueryStats.return_value = [ent_1]
+    collector.content = _succeed(content)
+
+    collector.__dict__['counter_ids'] = _succeed({
+        'cpu.demand.average': 2,
+    })
+
+    collector.__dict__['host_labels'] = _succeed({
+        'host:1': ['host-1', 'dc', 'cluster-1'],
+    })
+
+    collector.__dict__['host_system_inventory'] = _succeed({
+        'host:1': {
+            'name': 'host-1',
+            'obj': vim.ManagedObject('host-1'),
+            'runtime.powerState': 'poweredOn',
+            'summary.customValue': {
+                'capacity_type': 'dedicated',
+            },
+        },
+    })
+    collector._hostsCustomAttributes = {
+        'host:1': {'capacity_type': 'dedicated'},
+    }
+
+    yield collector._vmware_get_host_perf_manager_metrics(metrics)
+
+    assert metrics['vmware_host_cpu_demand_average'].samples[0][1] == {
+        'host_name': 'host-1',
+        'cluster_name': 'cluster-1',
+        'dc_name': 'dc',
+        'capacity_type': 'dedicated',
+    }
+    assert metrics['vmware_host_cpu_demand_average'].samples[0][2] == 3600.0
+
+
+@pytest_twisted.inlineCallbacks
+def test_collect_vm_perf_with_custom_attributes():
+    collect_only = {
+        'vms': True,
+        'vmguests': False,
+        'datastores': False,
+        'hosts': False,
+        'snapshots': False,
+    }
+    collector = VmwareCollector(
+        '127.0.0.1',
+        'root',
+        'password',
+        collect_only,
+        5000,
+        True,
+    )
+
+    metrics = collector._create_metric_containers()
+
+    metric_1 = mock.Mock()
+    metric_1.id.counterId = 10
+    metric_1.value = [9]
+
+    ent_1 = mock.Mock()
+    ent_1.value = [metric_1]
+    ent_1.entity = vim.ManagedObject('vm:1')
+
+    content = mock.Mock()
+    content.perfManager.QueryStats.return_value = [ent_1]
+    collector.content = _succeed(content)
+
+    collector.__dict__['counter_ids'] = _succeed({
+        'net.transmitted.average': 10,
+    })
+
+    collector.__dict__['vm_labels'] = _succeed({
+        'vm:1': ['vm-1', 'datastore-1', 'host-1', 'dc', 'cluster-1', '10.0.0.1'],
+    })
+
+    collector.__dict__['vm_inventory'] = _succeed({
+        'vm:1': {
+            'name': 'vm-1',
+            'obj': vim.ManagedObject('vm-1'),
+            'runtime.powerState': 'poweredOn',
+            'summary.customValue': {
+                'environment': 'production',
+            },
+        },
+    })
+    collector._vmsCustomAttributes = {
+        'vm:1': {'environment': 'production'},
+    }
+
+    yield collector._vmware_get_vm_perf_manager_metrics(metrics)
+
+    assert metrics['vmware_vm_net_transmitted_average'].samples[0][1] == {
+        'vm_name': 'vm-1',
+        'ds_name': 'datastore-1',
+        'host_name': 'host-1',
+        'cluster_name': 'cluster-1',
+        'dc_name': 'dc',
+        'vm_ip_address': '10.0.0.1',
+        'environment': 'production',
+    }
+    assert metrics['vmware_vm_net_transmitted_average'].samples[0][2] == 9.0
+
+
+@pytest_twisted.inlineCallbacks
 def test_collect_datastore():
     collect_only = {
         'vms': True,
