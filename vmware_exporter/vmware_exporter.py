@@ -19,18 +19,18 @@ import logging
 import datetime
 import yaml
 import requests
+import urllib3
 
 """
 disable annoying urllib3 warning messages for connecting to servers with non verified certificate Doh!
 """
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Twisted
 from twisted.web.server import Site, NOT_DONE_YET
 from twisted.web.resource import Resource
 from twisted.internet import reactor, endpoints, defer, threads
+from twisted.python import failure
 
 # VMWare specific imports
 from pyVmomi import vim, vmodl
@@ -40,8 +40,8 @@ from pyVim import connect
 from prometheus_client.core import GaugeMetricFamily
 from prometheus_client import CollectorRegistry, generate_latest
 
-from .helpers import batch_fetch_properties, get_bool_env
-from .defer import parallelize, run_once_property
+from .helpers import batch_fetch_properties, get_bool_env, get_string_list_env
+from .defer import parallelize, run_once_property, BranchingDeferred
 
 from .__init__ import __version__
 
@@ -58,7 +58,10 @@ class VmwareCollector():
             fetch_custom_attributes=False,
             ignore_ssl=False,
             fetch_tags=False,
-            fetch_alarms=False
+            fetch_alarms=False,
+            fetch_custom_attributes_on_perf=True,
+            custom_attributes_blacklist=None,
+            custom_attributes_on_perf_metrics=None,
     ):
 
         self.host = host
@@ -75,6 +78,13 @@ class VmwareCollector():
         # Custom Attributes
         # flag to wheter fetch custom attributes or not
         self.fetch_custom_attributes = fetch_custom_attributes
+        self.fetch_custom_attributes_on_perf = fetch_custom_attributes_on_perf
+        self.custom_attributes_blacklist = {
+            name.lower() for name in self._parse_string_list(custom_attributes_blacklist)
+        }
+        self.custom_attributes_on_perf_metrics = set(
+            self._parse_string_list(custom_attributes_on_perf_metrics)
+        )
         # vms, hosts and datastores custom attributes must be stored by their moid
         self._vmsCustomAttributes = {}
         self._hostsCustomAttributes = {}
@@ -93,7 +103,7 @@ class VmwareCollector():
             'vms': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name', 'vm_ip_address'],
             'vm_perf': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name', 'vm_ip_address'],
             'vmguests': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name', 'vm_ip_address'],
-            'snapshots': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
+            'snapshots': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name', 'vm_ip_address'],
             'datastores': ['ds_name', 'dc_name', 'ds_cluster'],
             'hosts': ['host_name', 'dc_name', 'cluster_name'],
             'host_perf': ['host_name', 'dc_name', 'cluster_name'],
@@ -433,7 +443,7 @@ class VmwareCollector():
             yield parallelize(*tasks)
         except Exception as e:
             logging.error("Error during metrics collection: {error}".format(error=str(e)))
-            # Continue with available metrics rather than failing completely
+            raise
 
         try:
             yield self._vmware_disconnect()
@@ -460,6 +470,35 @@ class VmwareCollector():
             
         return sanitized_value
 
+    def _parse_string_list(self, value):
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(',') if item.strip()]
+        return []
+
+    def _include_custom_attributes_for_metric_type(self, metric_type):
+        if not self.fetch_custom_attributes:
+            return False
+        if metric_type in ('vm_perf', 'host_perf'):
+            return self.fetch_custom_attributes_on_perf
+        return True
+
+    def _include_custom_attributes_for_perf_metric(self, metric_name):
+        if not self.custom_attributes_on_perf_metrics:
+            return True
+        return metric_name in self.custom_attributes_on_perf_metrics
+
+    def _filter_custom_attribute_label_names(self, label_names):
+        if not self.custom_attributes_blacklist:
+            return list(label_names)
+        return [
+            name for name in label_names
+            if name.lower() not in self.custom_attributes_blacklist
+        ]
+
     def _build_custom_attribute_label_values(self, entity_id, custom_attributes, custom_attribute_label_names):
         if not self.fetch_custom_attributes or not custom_attribute_label_names:
             return []
@@ -484,7 +523,9 @@ class VmwareCollector():
         for attributes in custom_attributes.values():
             names.update(attributes.keys())
 
-        return sorted(names, key=lambda item: str(item).lower())
+        return self._filter_custom_attribute_label_names(
+            sorted(names, key=lambda item: str(item).lower())
+        )
 
     def _normalized_unique_custom_attribute_labels(self, custom_attribute_names):
         """
@@ -496,7 +537,7 @@ class VmwareCollector():
         normalized_labels = []
         counters = {}
 
-        for raw_name in custom_attribute_names:
+        for raw_name in custom_attribute_names or []:
             base = self._normalize_custom_attribute_label(raw_name)
             idx = counters.get(base, 0)
             counters[base] = idx + 1
@@ -511,6 +552,20 @@ class VmwareCollector():
     def _to_epoch(self, my_date):
         """ convert to epoch time """
         return (my_date - datetime.datetime(1970, 1, 1, tzinfo=pytz.utc)).total_seconds()
+
+    def _unwrap_branching_deferred(self, value, property_name=None):
+        if value is not None:
+            return value
+
+        if property_name:
+            cached = self.__dict__.get(property_name)
+            if isinstance(cached, BranchingDeferred) and cached._branch_resolved:
+                cached_result = cached._branch_result
+                if isinstance(cached_result, failure.Failure):
+                    cached_result.raiseException()
+                return cached_result
+
+        return value
 
     @run_once_property
     @defer.inlineCallbacks
@@ -977,14 +1032,20 @@ class VmwareCollector():
 
         if metric_type in ('datastores',):
             labelNames = yield self.datastoresCustomAttributesLabelNames
+            labelNames = self._unwrap_branching_deferred(
+                labelNames, 'datastoresCustomAttributesLabelNames')
 
         if metric_type in ('vms', 'vm_perf', 'snapshots', 'vmguests'):
             labelNames = yield self.vmsCustomAttributesLabelNames
+            labelNames = self._unwrap_branching_deferred(
+                labelNames, 'vmsCustomAttributesLabelNames')
 
         if metric_type in ('hosts', 'host_perf'):
             labelNames = yield self.hostsCustomAttributesLabelNames
+            labelNames = self._unwrap_branching_deferred(
+                labelNames, 'hostsCustomAttributesLabelNames')
 
-        return labelNames
+        return labelNames or []
 
     @run_once_property
     @defer.inlineCallbacks
@@ -1130,7 +1191,7 @@ class VmwareCollector():
             # content or if this is doing stealth HTTP requests
             # Right now we assume it does stealth lookups
             datacenters = yield threads.deferToThread(lambda: content.rootFolder.childEntity)
-            return datacenters
+            return datacenters or []
         except Exception as e:
             logging.error("Failed to fetch datacenter inventory: {error}".format(error=str(e)))
             return []
@@ -1167,7 +1228,7 @@ class VmwareCollector():
         labels = {}
         try:
             dcs = yield self.datacenter_inventory
-            for dc in dcs:
+            for dc in dcs or []:
                 result = yield threads.deferToThread(lambda: _collect(dc))
                 labels.update(result)
         except Exception as e:
@@ -1211,7 +1272,7 @@ class VmwareCollector():
         labels = {}
         try:
             dcs = yield self.datacenter_inventory
-            for dc in dcs:
+            for dc in dcs or []:
                 result = yield threads.deferToThread(lambda: _collect(dc))
                 labels.update(result)
         except Exception as e:
@@ -1383,31 +1444,37 @@ class VmwareCollector():
         to be possible, we previously had to store metric names and map'em by object type, vms,
         hosts and datastores, and so its metrics, so as to gather everything here
         """
-        # Insert custom attributes names as metric labels
-        if self.fetch_custom_attributes:
+        for metric_type in metric_types:
 
-            for metric_type in metric_types:
+            if not self._include_custom_attributes_for_metric_type(metric_type):
+                continue
 
-                customAttributesLabelNames = yield self.customAttributesLabelNames(metric_type)
-                normalized_custom_attrs = self._normalized_unique_custom_attribute_labels(customAttributesLabelNames)
+            customAttributesLabelNames = yield self.customAttributesLabelNames(metric_type)
+            customAttributesLabelNames = self._unwrap_branching_deferred(
+                customAttributesLabelNames)
+            normalized_custom_attrs = self._normalized_unique_custom_attribute_labels(customAttributesLabelNames)
 
-                for metric_name in self._metricNames.get(metric_type, []):
-                    metric = metrics.get(metric_name)
-                    if metric and customAttributesLabelNames:  # Only proceed if we have custom attributes
-                        labelnames = list(metric._labelnames)  # Convert to list to ensure consistency
-                        base_label_count = len(self._labelNames[metric_type])
+            for metric_name in self._metricNames.get(metric_type, []):
+                if metric_type in ('vm_perf', 'host_perf'):
+                    if not self._include_custom_attributes_for_perf_metric(metric_name):
+                        continue
 
-                        # Rebuild labels idempotently: base + custom + additional labels.
-                        # If custom labels are already present right after base labels,
-                        # strip them before re-appending to keep order stable and avoid duplicates.
-                        base_labels = labelnames[:base_label_count]
-                        additional_labels = labelnames[base_label_count:] if len(labelnames) > base_label_count else []
+                metric = metrics.get(metric_name)
+                if metric and customAttributesLabelNames:  # Only proceed if we have custom attributes
+                    labelnames = list(metric._labelnames)  # Convert to list to ensure consistency
+                    base_label_count = len(self._labelNames[metric_type])
 
-                        if additional_labels[:len(normalized_custom_attrs)] == normalized_custom_attrs:
-                            additional_labels = additional_labels[len(normalized_custom_attrs):]
+                    # Rebuild labels idempotently: base + custom + additional labels.
+                    # If custom labels are already present right after base labels,
+                    # strip them before re-appending to keep order stable and avoid duplicates.
+                    base_labels = labelnames[:base_label_count]
+                    additional_labels = labelnames[base_label_count:] if len(labelnames) > base_label_count else []
 
-                        new_labelnames = base_labels + normalized_custom_attrs + additional_labels
-                        metric._labelnames = tuple(new_labelnames)
+                    if additional_labels[:len(normalized_custom_attrs)] == normalized_custom_attrs:
+                        additional_labels = additional_labels[len(normalized_custom_attrs):]
+
+                    new_labelnames = base_labels + normalized_custom_attrs + additional_labels
+                    metric._labelnames = tuple(new_labelnames)
 
     @defer.inlineCallbacks
     def _vmware_get_datastores(self, ds_metrics):
@@ -1434,7 +1501,11 @@ class VmwareCollector():
         customAttributesLabelNames = {}
         if self.fetch_custom_attributes:
             customAttributes = yield self.datastoresCustomAttributes
+            customAttributes = self._unwrap_branching_deferred(
+                customAttributes, 'datastoresCustomAttributes')
             customAttributesLabelNames = yield self.datastoresCustomAttributesLabelNames
+            customAttributesLabelNames = self._unwrap_branching_deferred(
+                customAttributesLabelNames, 'datastoresCustomAttributesLabelNames')
 
         """
         updates the datastore metric label names with custom attributes names
@@ -1617,9 +1688,18 @@ class VmwareCollector():
 
         custom_attributes = {}
         custom_attribute_label_names = []
-        if self.fetch_custom_attributes:
+        if self._include_custom_attributes_for_metric_type('vm_perf'):
             custom_attributes = yield self.vmsCustomAttributes
+            custom_attributes = self._unwrap_branching_deferred(
+                custom_attributes, 'vmsCustomAttributes') or {}
             custom_attribute_label_names = yield self.vmsCustomAttributesLabelNames
+            custom_attribute_label_names = self._unwrap_branching_deferred(
+                custom_attribute_label_names, 'vmsCustomAttributesLabelNames') or []
+            if not custom_attribute_label_names and self._vmsCustomAttributes:
+                custom_attribute_label_names = self._stable_custom_attribute_label_names(
+                    self._vmsCustomAttributes)
+            if not custom_attributes and self._vmsCustomAttributes:
+                custom_attributes = self._vmsCustomAttributes
 
         vm_tags = {}
         if self.fetch_tags:
@@ -1661,17 +1741,20 @@ class VmwareCollector():
                             tags = ','.join(tags) if tags else 'n/a'
                             final_labels.append(tags)
 
-                        final_labels.extend(
-                            self._build_custom_attribute_label_values(
-                                entity_id,
-                                custom_attributes,
-                                custom_attribute_label_names,
-                            )
+                        custom_labels = self._build_custom_attribute_label_values(
+                            entity_id,
+                            custom_attributes,
+                            custom_attribute_label_names,
                         )
 
                         for metric in ent.value:
-                            vm_metrics[metric_names[metric.id.counterId]].add_metric(
-                                final_labels,
+                            perf_metric_name = metric_names[metric.id.counterId]
+                            metric_labels = list(final_labels)
+                            if self._include_custom_attributes_for_perf_metric(perf_metric_name):
+                                metric_labels.extend(custom_labels)
+
+                            vm_metrics[perf_metric_name].add_metric(
+                                metric_labels,
                                 float(sum(metric.value)),
                             )
             except Exception as e:
@@ -1766,9 +1849,18 @@ class VmwareCollector():
 
         custom_attributes = {}
         custom_attribute_label_names = []
-        if self.fetch_custom_attributes:
+        if self._include_custom_attributes_for_metric_type('host_perf'):
             custom_attributes = yield self.hostsCustomAttributes
+            custom_attributes = self._unwrap_branching_deferred(
+                custom_attributes, 'hostsCustomAttributes') or {}
             custom_attribute_label_names = yield self.hostsCustomAttributesLabelNames
+            custom_attribute_label_names = self._unwrap_branching_deferred(
+                custom_attribute_label_names, 'hostsCustomAttributesLabelNames') or []
+            if not custom_attribute_label_names and self._hostsCustomAttributes:
+                custom_attribute_label_names = self._stable_custom_attribute_label_names(
+                    self._hostsCustomAttributes)
+            if not custom_attributes and self._hostsCustomAttributes:
+                custom_attributes = self._hostsCustomAttributes
 
         host_tags = {}
         if self.fetch_tags:
@@ -1808,17 +1900,20 @@ class VmwareCollector():
                         tags = ','.join(tags) if tags else 'n/a'
                         final_labels.append(tags)
 
-                    final_labels.extend(
-                        self._build_custom_attribute_label_values(
-                            entity_id,
-                            custom_attributes,
-                            custom_attribute_label_names,
-                        )
+                    custom_labels = self._build_custom_attribute_label_values(
+                        entity_id,
+                        custom_attributes,
+                        custom_attribute_label_names,
                     )
 
                     for metric in ent.value:
-                        host_metrics[metric_names[metric.id.counterId]].add_metric(
-                            final_labels,
+                        perf_metric_name = metric_names[metric.id.counterId]
+                        metric_labels = list(final_labels)
+                        if self._include_custom_attributes_for_perf_metric(perf_metric_name):
+                            metric_labels.extend(custom_labels)
+
+                        host_metrics[perf_metric_name].add_metric(
+                            metric_labels,
                             float(sum(metric.value)),
                         )
             except Exception as e:
@@ -1847,7 +1942,16 @@ class VmwareCollector():
         customAttributesLabelNames = {}
         if self.fetch_custom_attributes:
             customAttributes = yield self.vmsCustomAttributes
+            customAttributes = self._unwrap_branching_deferred(
+                customAttributes, 'vmsCustomAttributes') or {}
             customAttributesLabelNames = yield self.customAttributesLabelNames('vms')
+            customAttributesLabelNames = self._unwrap_branching_deferred(
+                customAttributesLabelNames) or []
+            if not customAttributesLabelNames and self._vmsCustomAttributes:
+                customAttributesLabelNames = self._stable_custom_attribute_label_names(
+                    self._vmsCustomAttributes)
+            if not customAttributes and self._vmsCustomAttributes:
+                customAttributes = self._vmsCustomAttributes
 
         # Insert custom attributes names as metric labels
         yield self.updateMetricsLabelNames(metrics, ['vms', 'vmguests', 'snapshots'])
@@ -1987,7 +2091,16 @@ class VmwareCollector():
         customAttributesLabelNames = {}
         if self.fetch_custom_attributes:
             customAttributes = yield self.hostsCustomAttributes
+            customAttributes = self._unwrap_branching_deferred(
+                customAttributes, 'hostsCustomAttributes') or {}
             customAttributesLabelNames = yield self.hostsCustomAttributesLabelNames
+            customAttributesLabelNames = self._unwrap_branching_deferred(
+                customAttributesLabelNames, 'hostsCustomAttributesLabelNames') or []
+            if not customAttributesLabelNames and self._hostsCustomAttributes:
+                customAttributesLabelNames = self._stable_custom_attribute_label_names(
+                    self._hostsCustomAttributes)
+            if not customAttributes and self._hostsCustomAttributes:
+                customAttributes = self._hostsCustomAttributes
 
         # Insert custom attributes names as metric labels
         yield self.updateMetricsLabelNames(host_metrics, ['hosts'])
@@ -2223,7 +2336,7 @@ class VMWareMetricsResource(Resource):
                     exit(1)
                 return
             except Exception as exception:
-                raise SystemExit("Error while reading configuration file: {0}".format(exception.message))
+                raise SystemExit("Error while reading configuration file: {0}".format(exception))
 
         self.config = {
             'default': {
@@ -2233,6 +2346,12 @@ class VMWareMetricsResource(Resource):
                 'ignore_ssl': get_bool_env('VSPHERE_IGNORE_SSL', False),
                 'specs_size': os.environ.get('VSPHERE_SPECS_SIZE', 5000),
                 'fetch_custom_attributes': get_bool_env('VSPHERE_FETCH_CUSTOM_ATTRIBUTES', False),
+                'fetch_custom_attributes_on_perf': get_bool_env(
+                    'VSPHERE_FETCH_CUSTOM_ATTRIBUTES_ON_PERF', True),
+                'custom_attributes_blacklist': get_string_list_env(
+                    'VSPHERE_CUSTOM_ATTRIBUTES_BLACKLIST'),
+                'custom_attributes_on_perf_metrics': get_string_list_env(
+                    'VSPHERE_CUSTOM_ATTRIBUTES_ON_PERF_METRICS'),
                 'fetch_tags': get_bool_env('VSPHERE_FETCH_TAGS', False),
                 'fetch_alarms': get_bool_env('VSPHERE_FETCH_ALARMS', False),
                 'collect_only': {
@@ -2260,6 +2379,12 @@ class VMWareMetricsResource(Resource):
                 'ignore_ssl': get_bool_env('VSPHERE_{}_IGNORE_SSL'.format(section), False),
                 'specs_size': os.environ.get('VSPHERE_{}_SPECS_SIZE'.format(section), 5000),
                 'fetch_custom_attributes': get_bool_env('VSPHERE_{}_FETCH_CUSTOM_ATTRIBUTES'.format(section), False),
+                'fetch_custom_attributes_on_perf': get_bool_env(
+                    'VSPHERE_{}_FETCH_CUSTOM_ATTRIBUTES_ON_PERF'.format(section), True),
+                'custom_attributes_blacklist': get_string_list_env(
+                    'VSPHERE_{}_CUSTOM_ATTRIBUTES_BLACKLIST'.format(section)),
+                'custom_attributes_on_perf_metrics': get_string_list_env(
+                    'VSPHERE_{}_CUSTOM_ATTRIBUTES_ON_PERF_METRICS'.format(section)),
                 'fetch_tags': get_bool_env('VSPHERE_{}_FETCH_TAGS'.format(section), False),
                 'fetch_alarms': get_bool_env('VSPHERE_{}_FETCH_ALARMS'.format(section), False),
                 'collect_only': {
@@ -2347,6 +2472,12 @@ class VMWareMetricsResource(Resource):
             self.config[section]['ignore_ssl'],
             self.config[section]['fetch_tags'],
             self.config[section]['fetch_alarms'],
+            fetch_custom_attributes_on_perf=self.config[section].get(
+                'fetch_custom_attributes_on_perf', True),
+            custom_attributes_blacklist=self.config[section].get(
+                'custom_attributes_blacklist', []),
+            custom_attributes_on_perf_metrics=self.config[section].get(
+                'custom_attributes_on_perf_metrics', []),
         )
         metrics = yield collector.collect()
 

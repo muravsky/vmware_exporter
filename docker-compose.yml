@@ -2,7 +2,7 @@ version: '2'
 services:
   vmware_exporter:
     # Using the latest tag, but you can use vers(v0.9.5 for example
-    image: pryorda/vmware_exporter:latest
+    image: muravsky/vmware-exporter:latest
     ports:
         - "9275:9272"
     environment:

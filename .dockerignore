@@ -1,1 +1,28 @@
+# Local secrets and config
 config.yml
+.env
+*.env
+
+# Virtual environments
+.venv/
+.venv-win/
+.venv-wsl/
+venv/
+
+# Git and editor metadata
+.git/
+.gitignore
+.github/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local scripts not needed in runtime image
+scripts/

@@ -2,6 +2,9 @@
 
 Prometheus exporter for VMware vCenter / vSphere.
 
+Maintained fork of [pryorda/vmware_exporter](https://github.com/pryorda/vmware_exporter) by Daniel Pryor.
+Docker image: [`muravsky/vmware-exporter`](https://hub.docker.com/r/muravsky/vmware-exporter).
+Source: [`muravsky/vmware_exporter`](https://github.com/muravsky/vmware_exporter).
 ## What it exports
 
 - VM metrics (power state, CPU, memory)
@@ -37,6 +40,13 @@ default:
   ignore_ssl: true
   specs_size: 5000
   fetch_custom_attributes: true
+  fetch_custom_attributes_on_perf: true
+  custom_attributes_blacklist:
+    - Backup
+    - TicketNumber
+  custom_attributes_on_perf_metrics:
+    - vmware_host_cpu_usage_average
+    - vmware_vm_net_transmitted_average
   fetch_tags: false
   fetch_alarms: false
   collect_only:
@@ -65,6 +75,9 @@ vmware_exporter -c /path/to/config.yml
 | `VSPHERE_IGNORE_SSL` | `False` | Ignore TLS certificate validation |
 | `VSPHERE_SPECS_SIZE` | `5000` | Batch size for performance query specs |
 | `VSPHERE_FETCH_CUSTOM_ATTRIBUTES` | `False` | Export custom attributes as labels |
+| `VSPHERE_FETCH_CUSTOM_ATTRIBUTES_ON_PERF` | `True` | Add custom attributes to VM/host performance metrics |
+| `VSPHERE_CUSTOM_ATTRIBUTES_BLACKLIST` | n/a | Comma-separated custom attribute names to exclude from all metrics |
+| `VSPHERE_CUSTOM_ATTRIBUTES_ON_PERF_METRICS` | n/a | Comma-separated performance metric names that receive custom attributes. If empty, all perf metrics get them |
 | `VSPHERE_FETCH_TAGS` | `False` | Export tags as labels |
 | `VSPHERE_FETCH_ALARMS` | `False` | Export triggered alarms |
 | `VSPHERE_COLLECT_VMS` | `True` | Collect VM metrics |
@@ -85,6 +98,9 @@ Example for section `limited`:
 - `VSPHERE_LIMITED_IGNORE_SSL`
 - `VSPHERE_LIMITED_SPECS_SIZE`
 - `VSPHERE_LIMITED_FETCH_CUSTOM_ATTRIBUTES`
+- `VSPHERE_LIMITED_FETCH_CUSTOM_ATTRIBUTES_ON_PERF`
+- `VSPHERE_LIMITED_CUSTOM_ATTRIBUTES_BLACKLIST`
+- `VSPHERE_LIMITED_CUSTOM_ATTRIBUTES_ON_PERF_METRICS`
 - `VSPHERE_LIMITED_FETCH_TAGS`
 - `VSPHERE_LIMITED_FETCH_ALARMS`
 - `VSPHERE_LIMITED_COLLECT_VMS`
@@ -189,15 +205,87 @@ docker buildx build \
   --push .
 ```
 
-## Source / credits
+## Test image on Docker Hub (without touching `latest`)
 
-This project is based on community VMware exporter work and keeps attribution to original sources:
+You can push an experimental build from your current working tree under a separate tag.
+`latest` on Docker Hub stays unchanged until you explicitly push `:latest`.
 
-- https://github.com/rverchere/vmware_exporter
-- https://github.com/pryorda/vmware_exporter
-- https://github.com/vmware/pyvmomi-community-samples
-- https://github.com/jbidinger/pyvmomi-tools
-- https://www.robustperception.io/writing-a-jenkins-exporter-in-python/
+Recommended tag names:
+
+- `dev-YYYYMMDD` for dated experiments
+- `dev-modernization` for the dependency upgrade branch
+- `canary` for short-lived smoke tests
+
+Windows (PowerShell):
+
+```powershell
+docker login
+.\scripts\docker-build-test.ps1 -Tag dev-modernization -Push
+```
+
+Linux / WSL:
+
+```bash
+docker login
+PUSH=1 TAG=dev-modernization ./scripts/docker-build-test.sh
+```
+
+Run production and test images side by side:
+
+```bash
+# current production image
+docker run -d --name vmware_exporter_old \
+  -p 9272:9272 \
+  -e VSPHERE_HOST=vcenter.company.com \
+  -e VSPHERE_USER=administrator@vsphere.local \
+  -e VSPHERE_PASSWORD=secret \
+  -e VSPHERE_IGNORE_SSL=true \
+  muravsky/vmware-exporter:latest
+
+# test image from Docker Hub
+docker run -d --name vmware_exporter_new \
+  -p 9273:9272 \
+  -e VSPHERE_HOST=vcenter.company.com \
+  -e VSPHERE_USER=administrator@vsphere.local \
+  -e VSPHERE_PASSWORD=secret \
+  -e VSPHERE_IGNORE_SSL=true \
+  muravsky/vmware-exporter:dev-modernization
+```
+
+Compare output:
+
+```bash
+curl -s http://localhost:9272/metrics -o old.txt
+curl -s http://localhost:9273/metrics -o new.txt
+diff old.txt new.txt
+```
+
+Optional parity helpers in `scripts/` (use env vars, no hardcoded hosts):
+
+```bash
+export PARITY_EXPORTER_HOST=exporter-host
+export PARITY_TARGET=vcenter.company.com
+python scripts/quick-prod-dev-diff.py
+python scripts/parity-compare.py old.txt new.txt
+```
+
+Local-only build (no push):
+
+```powershell
+.\scripts\docker-build-test.ps1 -Tag dev-local
+```
+
+## Origin and credits
+
+This repository is a maintained fork of [pryorda/vmware_exporter](https://github.com/pryorda/vmware_exporter) by [Daniel Pryor](https://github.com/pryorda), which in turn builds on earlier [rverchere/vmware_exporter](https://github.com/rverchere/vmware_exporter) work by Remi Verchere.
+
+Thanks and attribution:
+
+- [Daniel Pryor / pryorda](https://github.com/pryorda/vmware_exporter) — primary upstream exporter and long-time maintainer
+- [Remi Verchere / rverchere](https://github.com/rverchere/vmware_exporter) — original VMware exporter
+- [VMware pyvmomi-community-samples](https://github.com/vmware/pyvmomi-community-samples)
+- [jbidinger/pyvmomi-tools](https://github.com/jbidinger/pyvmomi-tools)
+- [Writing a Jenkins exporter in Python](https://www.robustperception.io/writing-a-jenkins-exporter-in-python/) — Prometheus exporter patterns
 
 Core libraries:
 
@@ -207,4 +295,4 @@ Core libraries:
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](LICENSE). The project remains under the BSD 3-Clause License; original copyright notices are preserved.

@@ -3,8 +3,10 @@ kind: Component
 metadata:
   name: vmware_exporter
   annotations:
-    github.com/project-slug: pryorda/vmware_exporter
+    github.com/project-slug: muravsky/vmware_exporter
+    backstage.io/source-location: url:https://github.com/muravsky/vmware_exporter
+    backstage.io/source-vcs: url:https://github.com/muravsky/vmware_exporter
 spec:
   type: service
-  lifecycle: unknown
-  owner: production-engineering
+  lifecycle: production
+  owner: muravsky

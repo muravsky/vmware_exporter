@@ -30,7 +30,7 @@ spec:
             name: vmware-exporter-config
         - secretRef:
             name: vmware-exporter-password
-        image: quay.io/jcallen/vmware_exporter:add_metrics
+        image: muravsky/vmware-exporter:latest
         imagePullPolicy: Always
         name: vmware-exporter
         ports:

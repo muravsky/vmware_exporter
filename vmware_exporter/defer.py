@@ -6,6 +6,8 @@ Helpers for writing efficient twisted code, optimized for coroutine scheduling e
 from twisted.internet import defer
 from twisted.python import failure
 
+_UNSET = object()
+
 
 class BranchingDeferred(defer.Deferred):
 
@@ -43,31 +45,89 @@ class BranchingDeferred(defer.Deferred):
     '''
 
     def __init__(self):
-        self.callbacks = []
-        self.result = None
+        defer.Deferred.__init__(self)
+        self._branch_callbacks = []
+        self._branch_result = _UNSET
+        self._branch_resolved = False
+
+    @property
+    def result(self):
+        if self._branch_resolved:
+            return self._branch_result
+        return None
+
+    @result.setter
+    def result(self, value):
+        # Twisted updates result while running callbacks; keep branch value stable.
+        if not self._branch_resolved:
+            self._branch_result = value
 
     def callback(self, result):
-        self.result = result
-        while self.callbacks:
-            self.callbacks.pop(0).callback(result)
+        if isinstance(result, failure.Failure):
+            return self.errback(result)
+
+        if self._branch_resolved:
+            return
+
+        self._branch_resolved = True
+        self._branch_result = result
+        waiters = self._branch_callbacks
+        self._branch_callbacks = []
+        for waiter in waiters:
+            waiter.callback(result)
+
+        defer.Deferred.callback(self, result)
 
     def errback(self, err):
-        self.result = err
-        while self.callbacks:
-            self.callbacks.pop(0).errback(err)
+        if not isinstance(err, failure.Failure):
+            err = failure.Failure(err)
 
-    def addCallbacks(self, *args, **kwargs):
-        if self.result is None:
+        if self._branch_resolved:
+            return
+
+        self._branch_resolved = True
+        self._branch_result = err
+        waiters = self._branch_callbacks
+        self._branch_callbacks = []
+        for waiter in waiters:
+            waiter.errback(err)
+
+        defer.Deferred.errback(self, err)
+
+    def addCallbacks(self, callback, errback=None,
+                     callbackArgs=None, callbackKeywords=None,
+                     errbackArgs=None, errbackKeywords=None):
+        if not self._branch_resolved:
             d = defer.Deferred()
-            d.addCallbacks(*args, **kwargs)
-            self.callbacks.append(d)
-            return
+            d.addCallbacks(
+                callback,
+                errback,
+                callbackArgs,
+                callbackKeywords,
+                errbackArgs,
+                errbackKeywords,
+            )
+            self._branch_callbacks.append(d)
+            return d
 
-        if isinstance(self.result, failure.Failure):
-            defer.fail(self.result).addCallbacks(*args, **kwargs)
-            return
+        if isinstance(self._branch_result, failure.Failure):
+            return defer.fail(self._branch_result).addCallbacks(
+                callback,
+                errback,
+                callbackArgs,
+                callbackKeywords,
+                errbackArgs,
+                errbackKeywords,
+            )
 
-        defer.succeed(self.result).addCallbacks(*args, **kwargs)
+        return defer.succeed(self._branch_result).addCallbacks(
+            callback,
+            errback,
+            callbackArgs,
+            callbackKeywords,
+            errbackArgs,
+            errbackKeywords,
+        )
 
 
 class run_once_property(object):

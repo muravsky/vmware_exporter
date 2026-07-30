@@ -8,6 +8,15 @@ def get_bool_env(key: str, default: bool):
     return value if type(value) == bool else value.lower() == 'true'
 
 
+def get_string_list_env(key: str, default=None):
+    value = os.environ.get(key, default)
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).split(',') if item.strip()]
+
+
 def _managed_object_type_matches(field_type, obj_type):
     """
     Return True if a custom field declared for ``field_type`` applies to ``obj_type``.
